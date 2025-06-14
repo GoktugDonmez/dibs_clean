@@ -1,0 +1,21 @@
+# environment.yml
+name: dibs_env
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pytorch
+  - torchvision
+  - torchaudio
+  - cpuonly # or cudatoolkit=11.6 for GPU
+  - jupyterlab
+  - mlflow
+  - numpy
+  - igraph
+  - pandas
+  - scikit-learn
+  - python-igraph
+  - matplotlib
+  - networkx
