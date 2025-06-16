@@ -160,6 +160,7 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
 
 
 
+
 def grad_theta_log_joint(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, Any], hparams: Dict[str, Any]) -> torch.Tensor:
     theta.requires_grad_(True)
     n_samples = hparams.get('n_grad_mc_samples', 1)
@@ -168,9 +169,9 @@ def grad_theta_log_joint(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, A
     log_density_samples = []
     for _ in range(n_samples):
         g_soft = bernoulli_soft_gmat(z, hparams)
-
-        log_lik_val = log_full_likelihood(data, g_soft, theta, hparams)
-        theta_eff = theta * g_soft
+        g_hard = torch.bernoulli(g_soft)
+        log_lik_val = log_full_likelihood(data, g_hard, theta, hparams)
+        theta_eff = theta * g_hard
         log_theta_prior_val = log_theta_prior(theta_eff, hparams.get('theta_prior_sigma', 1.0))
 
         current_log_density = log_lik_val + log_theta_prior_val
@@ -195,17 +196,21 @@ def grad_theta_log_joint(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, A
     if theta.grad is not None:
         theta.grad.zero_()
     theta.requires_grad_(False)
-    
-    # Final combined gradient
+
+    current_iter = hparams.get('current_iteration')
+    debug_iter = hparams.get('debug_print_iter')
+#    if current_iter is not None and debug_iter is not None and int(current_iter) == int(debug_iter):
+    log.info(f"[DEBUG grad_theta_log_joint iter {current_iter}] Denominator value: {denominator}")
+    log.info(f'debug grad theta log joint iter {current_iter}  numerator value {numerator_grad}')
+
     return  numerator_grad / denominator
 
 
 def grad_log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparams: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-    hparams_updated = update_dibs_hparams(hparams, params["t"].item())
     z, theta = params['z'], params['theta']
 
-    grad_z = grad_z_log_joint_gumbel(z, theta.detach(), data, hparams_updated)
-    grad_theta = grad_theta_log_joint(z.detach(), theta, data, hparams_updated)
+    grad_z = grad_z_log_joint_gumbel(z, theta.detach(), data, hparams)
+    grad_theta = grad_theta_log_joint(z.detach(), theta, data, hparams)
     
     return {"z": grad_z, "theta": grad_theta}
 
@@ -229,8 +234,9 @@ def log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparams: Di
 
 def update_dibs_hparams(hparams: Dict[str, Any], t_step: float) -> Dict[str, Any]:
     t = max(t_step, 1e-3)
-    factor = t + 1.0 / t               # JAX uses (t + 1/t)  :contentReference[oaicite:0]{index=0}
-    hparams['beta'] *= factor          # mutate in place so the next call sees the new value
+    factor = t + 1.0 / t               # JAX uses (t + 1/t)
+    hparams['beta']  = hparams['beta_base'] * factor          
+    hparams['current_iteration'] = t_step # Store current iteration
     hparams_updated = hparams
     return hparams_updated
 
