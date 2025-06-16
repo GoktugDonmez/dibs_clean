@@ -82,21 +82,29 @@ def gumbel_grad_acyclic_constr_mc(z: torch.Tensor, d: int, hparams: Dict[str, An
     """
     n_mc = hparams.get('n_nongrad_mc_samples', 10)
 
-    # Expand z once and turn on grad tracking
-    z_rep = z.expand(n_mc, *z.shape).clone().requires_grad_(True)   # [n_mc, d, k, 2]
+    # make a view that shares storage with z, but has a new batch dim
+    z_rep = z.unsqueeze(0).expand(n_mc, *z.shape).contiguous()
+    z_rep.requires_grad_(True)
 
-    # Draw soft adjacency matrices in one vectorised call
+    # sample your soft graphs
     g_soft = gumbel_soft_gmat(z_rep, hparams)      # [n_mc, d, d]
 
-    # Acyclicity penalties for every sample, then mean
-    h_vals = acyclic_constr(g_soft, d)             # [n_mc] or [n_mc, 1]
+    # for each sample, get the cycle‐penalty
+    # (we sample a *hard* graph for h if that's what your paper says,
+    #  but you can also do it on the soft if you like)
+    h_vals = []
+    for i in range(n_mc):
+        h_vals.append(acyclic_constr(g_soft[i], d))
+    h_vals = torch.stack(h_vals)                   # [n_mc]
+
+    # average penalty
     h_mean = h_vals.mean()
 
-    # Single backward() builds one graph only
-    h_mean.backward()
-    grad_z = z_rep.grad.mean(dim=0)                # [d, k, 2]
+    # differentiate once
+    grad_z_rep, = torch.autograd.grad(h_mean, z_rep)
 
-    return grad_z
+    # average over MC batch
+    return grad_z_rep.mean(0)                      # shape [d,k,2]
 
 def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, Any], hparams: Dict[str, Any]) -> torch.Tensor:
     d = z.shape[0]
@@ -116,6 +124,7 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
     grad_log_z_prior_total = -beta * grad_h_mc - z / sigma_z_sq
 
     # --- Part 2: Likelihood Gradient ---
+    
     log_density_samples = []
     for _ in range(hparams['n_grad_mc_samples']):
         g_soft_mc = gumbel_soft_gmat(z, hparams)
@@ -143,6 +152,8 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
     z.requires_grad_(False)
     
     # Final combined gradient
+    
+
     return grad_log_z_prior_total + (numerator_grad / denominator)
 
 
