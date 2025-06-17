@@ -131,6 +131,7 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
         log_lik_val = log_full_likelihood(data, g_soft_mc, theta_const, hparams)
         theta_eff_mc = theta_const * g_soft_mc
         log_theta_prior_val = log_theta_prior(theta_eff_mc, hparams.get('theta_prior_sigma', 1.0))
+        print(f"Log likelihood: {log_lik_val}, Log theta prior: {log_theta_prior_val}")
         log_density_samples.append(log_lik_val + log_theta_prior_val)
         
     log_p_tensor = torch.stack(log_density_samples)
@@ -158,6 +159,94 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
 
 
 
+import torch.nn.functional as F
+
+def manual_stable_gradient(log_p_tensor: torch.Tensor, grad_p_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Manually calculates the stable gradient for learning purposes,
+    re-implementing the logic of softmax and a weighted sum.
+
+    Args:
+        log_p_tensor: A tensor of log-joint probabilities, shape (n_samples,).
+        grad_p_tensor: A tensor of the gradients of the log-joint probabilities,
+                       shape (n_samples, *theta.shape).
+
+    Returns:
+        The numerically stable estimate of the gradient.
+    """
+    # --- Step 1: Manual Log-Sum-Exp ---
+    # Find the maximum log-probability to shift the values for stability.
+    log_p_max = torch.max(log_p_tensor)
+    # Calculate log(sum(exp(L_j))) stably.
+    log_denominator = log_p_max + torch.log(torch.sum(torch.exp(log_p_tensor - log_p_max)))
+
+    # --- Step 2: Manual Softmax Weights ---
+    # Calculate the log of the weights: log(w_m) = log(p_m) - log(sum(p_j))
+    log_weights = log_p_tensor - log_denominator
+    # Get the weights by exponentiating the stable log-weights.
+    weights = torch.exp(log_weights)
+
+    # --- Step 3: Weighted Average ---
+    # Reshape weights to broadcast with the gradient tensor.
+    dims_to_add = grad_p_tensor.dim() - 1
+    weights_reshaped = weights.view(-1, *([1] * dims_to_add))
+    # Multiply and sum to get the final gradient estimate.
+    final_gradient = torch.sum(weights_reshaped * grad_p_tensor, dim=0)
+    print(f"Final gradient:\n {final_gradient}")
+
+    return final_gradient
+
+def softmax_stable_gradient(log_p_tensor: torch.Tensor, grad_p_tensor: torch.Tensor, verbose: bool = True) -> torch.Tensor:
+    """
+    Calculates the stable gradient using the built-in torch.nn.functional.softmax,
+    with added prints for debugging.
+
+    Args:
+        log_p_tensor: A tensor of log-joint probabilities, shape (n_samples,).
+        grad_p_tensor: A tensor of the gradients of the log-joint probabilities,
+                       shape (n_samples, *theta.shape).
+        verbose: If True, prints diagnostic information.
+
+    Returns:
+        The numerically stable estimate of the gradient.
+    """
+    if verbose:
+        print("\n--- Softmax Version Diagnostics ---")
+        # 1. Analyze the input log-probabilities. This tells you the range of your joint distribution values.
+        print(f"\n[Input log_p_tensor stats]")
+        print(f"  Min: {log_p_tensor.min():.4f}, Max: {log_p_tensor.max():.4f}, Mean: {log_p_tensor.mean():.4f}, Std: {log_p_tensor.std():.4f}")
+
+        # 2. Analyze the raw gradients before they are averaged. This is key.
+        # If these values are large, the output will likely be large.
+        print(f"\n[Input grad_p_tensor stats (raw gradients)]")
+        print(f"  Min: {grad_p_tensor.min():.4f}, Max: {grad_p_tensor.max():.4f}, Mean: {grad_p_tensor.mean():.4f}")
+
+    # --- Step 1: Calculate weights using built-in softmax ---
+    # This is the numerically stable way to get the weights w_m = p_m / sum(p_j).
+    weights = F.softmax(log_p_tensor, dim=0)
+
+    if verbose:
+        # 3. Analyze the resulting weights. This tells you how the average is distributed.
+        # If Max is close to 1.0, one sample is dominating the expectation.
+        print(f"\n[Calculated softmax weights stats]")
+        print(f"  Min: {weights.min():.4e}, Max: {weights.max():.4e}, Sum: {weights.sum():.4f}")
+        # It's also useful to see how many weights are non-trivial
+        non_trivial_weights = (weights > 1e-6).sum()
+        print(f"  Number of non-trivial weights (>1e-6): {non_trivial_weights}/{len(weights)}")
+
+    # --- Step 2: Calculate the weighted average ---
+    # torch.einsum is a clean, general way to perform the weighted sum.
+    # 's' is the sample dimension, '...' are the remaining gradient dimensions.
+    final_gradient = torch.einsum('s,s...->...', weights, grad_p_tensor)
+
+    if verbose:
+        # 4. Analyze the final output gradient.
+        print("\n[Final weighted gradient stats]")
+        print(f"  Min: {final_gradient.min():.4f}, Max: {final_gradient.max():.4f}, Mean: {final_gradient.mean():.4f}")
+        print(f"Final gradient tensor:\n{final_gradient}")
+        print("--- End Diagnostics ---\n")
+
+    return final_gradient
 
 
 
@@ -167,43 +256,32 @@ def grad_theta_log_joint(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, A
 
     theta = theta.clone().detach().requires_grad_(True)
     log_density_samples = []
+    grad_samples = []
     for _ in range(n_samples):
         g_soft = bernoulli_soft_gmat(z, hparams)
-        g_hard = torch.bernoulli(g_soft)
-        log_lik_val = log_full_likelihood(data, g_hard, theta, hparams)
-        theta_eff = theta * g_hard
+        #g_hard = torch.bernoulli(g_soft)
+        log_lik_val = log_full_likelihood(data, g_soft, theta, hparams)
+        theta_eff = theta * g_soft
         log_theta_prior_val = log_theta_prior(theta_eff, hparams.get('theta_prior_sigma', 1.0))
 
         current_log_density = log_lik_val + log_theta_prior_val
+        current_grad ,= torch.autograd.grad(current_log_density, theta)
         log_density_samples.append(current_log_density) 
+        grad_samples.append(current_grad)
 
     log_p_tensor = torch.stack(log_density_samples)
+    grad_p_tensor = torch.stack(grad_samples)
 
-
-    with torch.no_grad():
-        max_log_p = torch.max(log_p_tensor)
-    # Denominator: E[p(D,Θ|G)]
-    p_tensor_stabilized = torch.exp(log_p_tensor.detach() - max_log_p)
-    denominator = torch.mean(p_tensor_stabilized) + 1e-20 # Add jitter for stability
-    
-    # Numerator: ∇_Z E[p(D,Θ|G)]
-    # This is ∇_Z of the mean of the probabilities
-    p_tensor_for_grad = torch.exp(log_p_tensor - max_log_p)
-    mean_p_for_grad = torch.mean(p_tensor_for_grad)
-    numerator_grad, = torch.autograd.grad(mean_p_for_grad, theta)
 
     # Cleanup
     if theta.grad is not None:
         theta.grad.zero_()
     theta.requires_grad_(False)
 
-    current_iter = hparams.get('current_iteration')
-    debug_iter = hparams.get('debug_print_iter')
-#    if current_iter is not None and debug_iter is not None and int(current_iter) == int(debug_iter):
-    log.info(f"[DEBUG grad_theta_log_joint iter {current_iter}] Denominator value: {denominator}")
-    log.info(f'debug grad theta log joint iter {current_iter}  numerator value {numerator_grad}')
+    #grad =manual_stable_gradient(log_p_tensor, grad_p_tensor)
+    grad = softmax_stable_gradient(log_p_tensor, grad_p_tensor)
 
-    return  numerator_grad / denominator
+    return  grad
 
 
 def grad_log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparams: Dict[str, Any]) -> Dict[str, torch.Tensor]:
