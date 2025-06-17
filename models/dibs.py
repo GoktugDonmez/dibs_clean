@@ -166,16 +166,18 @@ def logsumexp_v1(log_tensor: torch.Tensor) -> torch.Tensor:
     M = log_tensor.shape[0]
     logM = torch.log(torch.tensor(M, dtype=log_tensor.dtype, device=log_tensor.device))
 
+    
     log_sum_exp = torch.logsumexp(log_tensor, dim=0)
 
     total = log_sum_exp - logM
-    return torch.exp(log_tensor - total)
+    return total # torch.exp(total)
 
 def manual_stable_gradient(log_p_tensor: torch.Tensor, grad_p_tensor: torch.Tensor) -> torch.Tensor:
 # uses the logsumexp_v1 function to compute the stable gradient
 
     print(f'log density values and shape: {log_p_tensor}, {log_p_tensor.shape}')
-    log_density_lse = logsumexp_v1(log_p_tensor)
+    log_density_lse = torch.exp(torch.logsumexp(log_p_tensor, dim=0) - log_p_tensor.shape[0])  # logsumexp_v1(log_p_tensor)
+    # logsumexp_v1(log_p_tensor)
     print(f'log density lse value: {log_density_lse}, shape: {log_density_lse.shape}')
 
     print('-' * 50)
@@ -183,38 +185,8 @@ def manual_stable_gradient(log_p_tensor: torch.Tensor, grad_p_tensor: torch.Tens
     grad_lse = logsumexp_v1(grad_p_tensor)
     print(f'grad density lse value: {grad_lse}, shape: {grad_lse.shape}')
 
-    return grad_lse / log_density_lse[:, None]
+    return torch.exp(logsumexp_v1(grad_p_tensor) - logsumexp_v1(log_p_tensor)) # grad_lse / log_density_lse[:, None]
 
-def stable_gradient_estimator(log_density_samples: torch.Tensor, grad_samples: torch.Tensor, verbose: bool = False) -> torch.Tensor:
-    """
-    Computes a numerically stable estimate for a ratio of expectations,
-    which simplifies to a weighted average of gradients.
-    """
-    if verbose:
-        print("--- stable_gradient_estimator ---")
-        print(f"  Input log_density_samples shape: {log_density_samples.shape}")
-        print(f"  Input grad_samples shape: {grad_samples.shape}")
-
-    # Compute stable weights via softmax (this is the log-sum-exp trick)
-    weights = torch.nn.functional.softmax(log_density_samples, dim=0)
-    if verbose:
-        print(f"  Computed weights shape: {weights.shape}")
-        print(f"  Weights sum: {weights.sum():.4f}, Max weight: {weights.max():.4f}")
-
-    # Reshape weights to broadcast with the gradient tensor
-    reshape_dims = [-1] + [1] * (grad_samples.dim() - 1)
-    reshaped_weights = weights.view(*reshape_dims)
-    if verbose:
-        print(f"  Reshaped weights for broadcasting: {reshaped_weights.shape}")
-
-    # Compute the final weighted average of the gradients
-    final_grad = torch.sum(reshaped_weights * grad_samples, dim=0)
-    if verbose:
-        print(f"  Final gradient shape: {final_grad.shape}")
-        print("---------------------------------")
-        print(f"  Final gradient values: {final_grad}")
-
-    return final_grad
 
 def grad_theta_log_joint(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, Any], hparams: Dict[str, Any]) -> torch.Tensor:
     theta.requires_grad_(True)
@@ -248,9 +220,9 @@ def grad_theta_log_joint(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, A
         theta.grad.zero_()
     theta.requires_grad_(False)
 
-    #grad =manual_stable_gradient(log_p_tensor, grad_p_tensor)
-    grad = stable_gradient_estimator(log_p_tensor, grad_p_tensor)
-    print(f"Grad_theta shape: {grad.shape}, values: \n {grad}")
+    grad =manual_stable_gradient(log_p_tensor, grad_p_tensor)
+    #grad = stable_gradient_estimator(log_p_tensor, grad_p_tensor)
+    #print(f"Grad_theta shape: {grad.shape}, values: \n {grad}")
 
     return  grad
 
