@@ -32,14 +32,27 @@ def bernoulli_soft_gmat(z: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tenso
         diag_mask = diag_mask.expand(probs.shape[0], d, d)
     return probs * diag_mask
 
-def gumbel_soft_gmat(z: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
-    raw = scores(z, hparams['alpha'])
+def gumbel_soft_gmat(z: torch.Tensor,
+                     hparams: Dict[str, Any]) -> torch.Tensor:
+    """
+    Soft Gumbel–Softmax adjacency  (Eq. B.6)
+
+        g_ij  = σ_τ( L_ij + α⟨u_i , v_j⟩ )
+
+    where  L_ij ~ Logistic(0,1)  and  τ = hparams['tau']. appendix b2
+    """
+    raw = scores(z, hparams["alpha"])
+
+    # Logistic(0,1) noise   L = log U - log(1-U)
     u = torch.rand_like(raw)
-    noise = torch.log(u) - torch.log1p(-u)
-    soft = torch.sigmoid((noise + raw) * hparams['tau'])
-    d = soft.shape[-1]
-    mask = 1.0 - torch.eye(d, device=soft.device, dtype=soft.dtype)
-    return soft * mask
+    L = torch.log(u) - torch.log1p(-u)
+
+    logits = (raw + L) / hparams["tau"]
+    g_soft = torch.sigmoid(logits)
+
+    d = g_soft.size(-1)
+    mask = 1.0 - torch.eye(d, device=z.device, dtype=z.dtype)
+    return g_soft * mask
 
 def log_full_likelihood(data: Dict[str, Any], soft_gmat: torch.Tensor, theta: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
     ## TODO: Expert belief: update this to use interventions, change the full likelihood 
@@ -57,54 +70,16 @@ def gumbel_acyclic_constr_mc(z: torch.Tensor, d: int, hparams: Dict[str, Any]) -
     h_samples = []
     for _ in range(hparams['n_nongrad_mc_samples']):
         g_soft = gumbel_soft_gmat(z, hparams)
-        h_samples.append(acyclic_constr(torch.bernoulli(g_soft), d))
-    return torch.mean(torch.stack(h_samples))
-
-def gumbel_grad_acyclic_constr_mc(z: torch.Tensor, d: int, hparams: Dict[str, Any]) -> torch.Tensor:
-    """
-    Monte Carlo estimation of gradient of acyclicity constraint using Gumbel soft adjacency matrices.
-    
-    This implements the MC estimator for ∇_z E[h(G_soft)] where G_soft ~ Gumbel-softmax.
-    
-    For each MC sample:
-    1. Sample a Gumbel soft adjacency matrix G_soft using gumbel_soft_gmat(z, hparams)
-    2. Apply acyclicity constraint h(G_soft) 
-    3. Compute gradient ∇_z h(G_soft) via backprop
-    4. Return mean of all gradient samples for unbiased MC estimate
-    
-    Args:
-        z: Latent variables [d, k, 2] 
-        d: Number of nodes
-        hparams: Hyperparameters including n_nongrad_mc_samples
-    
-    Returns:
-        MC estimate of ∇_z E[h(G_soft)] with same shape as z
-    """
-    n_mc = hparams.get('n_nongrad_mc_samples', 10)
-
-    # make a view that shares storage with z, but has a new batch dim
-    z_rep = z.unsqueeze(0).expand(n_mc, *z.shape).contiguous()
-    z_rep.requires_grad_(True)
-
-    # sample your soft graphs
-    g_soft = gumbel_soft_gmat(z_rep, hparams)      # [n_mc, d, d]
-
-    # for each sample, get the cycle‐penalty
-    # (we sample a *hard* graph for h if that's what your paper says,
-    #  but you can also do it on the soft if you like)
-    h_vals = []
-    for i in range(n_mc):
-        h_vals.append(acyclic_constr(g_soft[i], d))
-    h_vals = torch.stack(h_vals)                   # [n_mc]
-
-    # average penalty
-    h_mean = h_vals.mean()
-
-    # differentiate once
-    grad_z_rep, = torch.autograd.grad(h_mean, z_rep)
-
-    # average over MC batch
-    return grad_z_rep.mean(0)                      # shape [d,k,2]
+        # should gumbel soft gmat to hard gmat be done with >0.5 or with a sigmoid?  
+        # g_hard = torch.bernoulli(g_soft) ? 
+        #g_hard = (g_soft > 0.5).float()
+        #how about this  mentioned in dibs       g_ST   = g_hard + (g_soft - g_soft.detach())   # straight-through
+        
+        #TODO fix above
+        # for now use g_soft
+        h_samples.append(acyclic_constr(g_soft, d))
+    h_samples = torch.stack(h_samples)
+    return torch.mean(h_samples, dim=0)
 
 def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, Any], hparams: Dict[str, Any]) -> torch.Tensor:
     d = z.shape[0]
@@ -116,36 +91,30 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
     z.requires_grad_(True)
     # --- Part 1: Prior Gradient ---
     # MC estimate of gradient of acyclicity constraint using Gumbel soft graphs
-    # This computes ∇_z E[h(G_soft)] where G_soft ~ Gumbel-softmax
-    grad_h_mc = gumbel_grad_acyclic_constr_mc(z, d, hparams)
-    
-    # Prior gradient: acyclicity penalty + gaussian prior term
-    # ∇_z log p(z) = -β * ∇_z E[h(G_soft)] - z/σ²
+
+    h_mean = gumbel_acyclic_constr_mc(z, d, hparams)
+    grad_h_mc = torch.autograd.grad(h_mean, z)[0]
     grad_log_z_prior_total = -beta * grad_h_mc - z / sigma_z_sq
 
     # --- Part 2: Likelihood Gradient ---
     
     log_density_samples = []
     for _ in range(hparams['n_grad_mc_samples']):
-        g_soft_mc = gumbel_soft_gmat(z, hparams)
-        log_lik_val = log_full_likelihood(data, g_soft_mc, theta_const, hparams)
-        theta_eff_mc = theta_const * g_soft_mc
+        g_soft = gumbel_soft_gmat(z, hparams)
+
+        log_lik_val = log_full_likelihood(data, g_soft, theta_const, hparams)
+        theta_eff_mc = theta_const * g_soft
         log_theta_prior_val = log_theta_prior(theta_eff_mc, hparams.get('theta_prior_sigma', 1.0))
         log_density_samples.append(log_lik_val + log_theta_prior_val)
-        
-    log_p_tensor = torch.stack(log_density_samples)
+    #print(f'log_density_samples shape: {len(log_density_samples)}')
+    #print(f'log_density_samples values: {log_density_samples}')
+    log_p = torch.stack(log_density_samples)
 
-    with torch.no_grad():
-        max_log_p = torch.max(log_p_tensor)    
+    log_sum = torch.logsumexp(log_p, dim=0)
+    
+    # Compute the gradient directly on log_sum. This avoids the unstable exp() and division.
+    grad_lik, = torch.autograd.grad(log_sum, z)
 
-
-
-    log_weights = log_p_tensor - max_log_p           # still on same device
-    log_den = torch.logsumexp(log_weights, dim=0)    # log E[p]
-    denominator = torch.exp(log_den)                 # never < 1
-    weights = torch.exp(log_weights - log_den)       # soft-max, Σw = 1
-    mean_p_for_grad = torch.sum(weights * torch.exp(log_weights))   # == 1
-    numerator_grad, = torch.autograd.grad(mean_p_for_grad, z)
 
     if z.grad is not None:
         z.grad.zero_()
@@ -154,11 +123,41 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
     # Final combined gradient
     
 
-    return grad_log_z_prior_total + (numerator_grad / denominator)
+
+
+    # 3) Combine
+    # ------------------------------------------------
+    return grad_log_z_prior_total + grad_lik
 
 
 
-import torch.nn.functional as F
+
+
+def weighted_grad(log_p: torch.Tensor,
+                  grad_p: torch.Tensor) -> torch.Tensor:
+    """
+    Return   Σ softmax(log_p)_m * grad_p[m]
+    Shapes
+        log_p   : (M,)
+        grad_p  : (M, …)   (any extra dims)
+    """
+    # 1. numerically stable soft-max weights
+    #print(f'log_p shape: {log_p.shape}, values:\n {log_p}')
+    #print(f'grad_p shape: {grad_p.shape}, values: \n{grad_p}')
+    log_p_shifted = log_p - log_p.max()          # (M,)
+    #print(f'log_p_shifted shape: {log_p_shifted.shape}, values: \n {log_p_shifted}')
+    w = torch.exp(log_p_shifted)
+    #print(f'w shape: {w.shape}, values:\n {w}')
+    w = w / w.sum()
+    #print(f'w after normalization shape: {w.shape}, values:\n {w}')
+
+    # 2. broadcast weights onto grad tensor
+    while w.dim() < grad_p.dim():
+        w = w.unsqueeze(-1)                      # (M,1,1,...)
+
+    return (w * grad_p).sum(dim=0)               # same shape as grad slice
+
+
 
 def logsumexp_v1(log_tensor: torch.Tensor) -> torch.Tensor:
 
@@ -220,7 +219,7 @@ def grad_theta_log_joint(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, A
         theta.grad.zero_()
     theta.requires_grad_(False)
 
-    grad =manual_stable_gradient(log_p_tensor, grad_p_tensor)
+    grad =weighted_grad(log_p_tensor, grad_p_tensor)
     #grad = stable_gradient_estimator(log_p_tensor, grad_p_tensor)
     #print(f"Grad_theta shape: {grad.shape}, values: \n {grad}")
 
