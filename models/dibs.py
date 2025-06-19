@@ -69,6 +69,7 @@ def log_theta_prior(theta_effective: torch.Tensor, sigma: float) -> torch.Tensor
 def gumbel_acyclic_constr_mc(z: torch.Tensor, d: int, hparams: Dict[str, Any]) -> torch.Tensor:
     h_samples = []
     for _ in range(hparams['n_nongrad_mc_samples']):
+        # FOR NOW, JUST GIVE THE SOFT MATRIX, AND BY ANNEALING IT TO HARD MATRIX
         g_soft = gumbel_soft_gmat(z, hparams)
         h_samples.append(acyclic_constr(g_soft, d))
         
@@ -81,9 +82,9 @@ def gumbel_acyclic_constr_mc(z: torch.Tensor, d: int, hparams: Dict[str, Any]) -
         # for now use g_soft
         
         ### STRAIGHT THROUGH
-        g_hard = (g_soft > 0.5).float()  # Convert to hard graph
-        g_ST = g_hard + (g_soft - g_soft.detach()) 
-        h_samples.append(acyclic_constr(g_ST, d))
+        #g_hard = (g_soft > 0.5).float()  # Convert to hard graph
+        #g_ST = g_hard + (g_soft - g_soft.detach()) 
+        #h_samples.append(acyclic_constr(g_ST, d))
     h_samples = torch.stack(h_samples)
 
 
@@ -202,22 +203,20 @@ def grad_theta_log_joint(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, A
     log_density_samples = []
     grad_samples = []
     for _ in range(n_samples):
-        #g_soft = bernoulli_soft_gmat(z, hparams)
+        g_soft = bernoulli_soft_gmat(z, hparams)
         #print(f"g_soft values: {g_soft}")
-        #g_hard = torch.bernoulli(g_soft)
+        g_hard = torch.bernoulli(g_soft)
         #print(f"g_hard values: {g_hard}")
 
         # tryign with gumbel to be consistent with grad z and gumbel mc acylci impelmentation
-        g_soft = gumbel_soft_gmat(z, hparams)
-        g_hard = (g_soft > 0.5).float()
-        g_st = g_hard + (g_soft - g_soft.detach()) 
+        #g_soft = gumbel_soft_gmat(z, hparams)
 
 
 
 
 
-        log_lik_val = log_full_likelihood(data, g_st, theta, hparams)
-        theta_eff = theta * g_st
+        log_lik_val = log_full_likelihood(data, g_hard, theta, hparams)
+        theta_eff = theta * g_hard
         log_theta_prior_val = log_theta_prior(theta_eff, hparams.get('theta_prior_sigma', 1.0))
         #print(f"Grad_theta mc_samples Log likelihood:  {log_lik_val} Log theta prior: \n {log_theta_prior_val} \n ")
 
@@ -274,17 +273,29 @@ def update_dibs_hparams(hparams: Dict[str, Any], t_step: float) -> Dict[str, Any
     t = max(t_step, 1.0) # Ensure t is at least 1
 
 
-    beta_max = 50.0
-    beta_tau = 500         # iterations until β≈0.95*beta_max
-    hparams['beta'] = beta_max * (1 - np.exp(-t/beta_tau))
+    beta_max = 2000.0
+    beta_tau = 50         # iterations until β≈0.95*beta_max
+    #hparams['beta'] = beta_max * (1 - np.exp(-t/beta_tau))
+    #hparams['beta'] = hparams['beta_base'] * 0.2 * t
 
-    
     # Linear annealing for beta
     #hparams['beta'] = hparams['beta_base'] + (t - 1) * 0.2 # Adjust the step size as needed
 
     # Your alpha annealing
-    hparams['alpha'] = hparams['alpha_base'] * 0.02 * t
+    #hparams['alpha'] = hparams['alpha_base'] * 0.2 * t
     
+    beta_max = 200.0  # Set a reasonable maximum
+    beta_tau = 1000
+    hparams['beta'] = beta_max * (1 - np.exp(-t_step / beta_tau))
+    
+    # Anneal alpha (sharpness) even more slowly. Start it later if needed.
+    alpha_max = 10.0
+    alpha_tau = 2000
+    hparams['alpha'] = alpha_max * (1 - np.exp(-t_step / alpha_tau))
+
+
+
+
     hparams['current_iteration'] = t_step # Store current iteration
     return hparams
 
