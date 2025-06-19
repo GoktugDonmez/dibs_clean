@@ -284,7 +284,7 @@ def update_dibs_hparams(hparams: Dict[str, Any], t_step: float) -> Dict[str, Any
     # Your alpha annealing
     #hparams['alpha'] = hparams['alpha_base'] * 0.2 * t
     
-    beta_max = 200.0  # Set a reasonable maximum
+    beta_max = 2000.0  # Set a reasonable maximum
     beta_tau = 1000
     hparams['beta'] = beta_max * (1 - np.exp(-t_step / beta_tau))
     
