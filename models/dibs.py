@@ -70,6 +70,8 @@ def gumbel_acyclic_constr_mc(z: torch.Tensor, d: int, hparams: Dict[str, Any]) -
     h_samples = []
     for _ in range(hparams['n_nongrad_mc_samples']):
         g_soft = gumbel_soft_gmat(z, hparams)
+        h_samples.append(acyclic_constr(g_soft, d))
+        
         # should gumbel soft gmat to hard gmat be done with >0.5 or with a sigmoid?  
         # g_hard = torch.bernoulli(g_soft) ? 
         #g_hard = (g_soft > 0.5).float()
@@ -77,8 +79,14 @@ def gumbel_acyclic_constr_mc(z: torch.Tensor, d: int, hparams: Dict[str, Any]) -
         
         #TODO fix above
         # for now use g_soft
-        h_samples.append(acyclic_constr(g_soft, d))
+        
+        ### STRAIGHT THROUGH
+        g_hard = (g_soft > 0.5).float()  # Convert to hard graph
+        g_ST = g_hard + (g_soft - g_soft.detach()) 
+        h_samples.append(acyclic_constr(g_ST, d))
     h_samples = torch.stack(h_samples)
+
+
     return torch.mean(h_samples, dim=0)
 
 def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, Any], hparams: Dict[str, Any]) -> torch.Tensor:
@@ -194,12 +202,22 @@ def grad_theta_log_joint(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, A
     log_density_samples = []
     grad_samples = []
     for _ in range(n_samples):
-        g_soft = bernoulli_soft_gmat(z, hparams)
+        #g_soft = bernoulli_soft_gmat(z, hparams)
         #print(f"g_soft values: {g_soft}")
-        g_hard = torch.bernoulli(g_soft)
+        #g_hard = torch.bernoulli(g_soft)
         #print(f"g_hard values: {g_hard}")
-        log_lik_val = log_full_likelihood(data, g_hard, theta, hparams)
-        theta_eff = theta * g_hard
+
+        # tryign with gumbel to be consistent with grad z and gumbel mc acylci impelmentation
+        g_soft = gumbel_soft_gmat(z, hparams)
+        g_hard = (g_soft > 0.5).float()
+        g_st = g_hard + (g_soft - g_soft.detach()) 
+
+
+
+
+
+        log_lik_val = log_full_likelihood(data, g_st, theta, hparams)
+        theta_eff = theta * g_st
         log_theta_prior_val = log_theta_prior(theta_eff, hparams.get('theta_prior_sigma', 1.0))
         #print(f"Grad_theta mc_samples Log likelihood:  {log_lik_val} Log theta prior: \n {log_theta_prior_val} \n ")
 
@@ -253,12 +271,22 @@ def log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparams: Di
     return log_lik + log_prior_z + log_prior_theta
 
 def update_dibs_hparams(hparams: Dict[str, Any], t_step: float) -> Dict[str, Any]:
-    t = max(t_step, 1e-3)
-    factor = t + 1.0 / t               # JAX uses (t + 1/t)
-    hparams['beta']  = hparams['beta_base'] * factor          
+    t = max(t_step, 1.0) # Ensure t is at least 1
+
+
+    beta_max = 50.0
+    beta_tau = 500         # iterations until β≈0.95*beta_max
+    hparams['beta'] = beta_max * (1 - np.exp(-t/beta_tau))
+
+    
+    # Linear annealing for beta
+    #hparams['beta'] = hparams['beta_base'] + (t - 1) * 0.2 # Adjust the step size as needed
+
+    # Your alpha annealing
+    hparams['alpha'] = hparams['alpha_base'] * 0.02 * t
+    
     hparams['current_iteration'] = t_step # Store current iteration
-    hparams_updated = hparams
-    return hparams_updated
+    return hparams
 
 
 def hard_gmat_from_z(z: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
