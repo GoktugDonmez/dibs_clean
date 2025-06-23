@@ -12,8 +12,11 @@ log = logging.getLogger(__name__)
 def log_gaussian_likelihood(x: torch.Tensor, pred_mean: torch.Tensor, sigma: float = 0.1) -> torch.Tensor:
     sigma_tensor = torch.tensor(sigma, dtype=pred_mean.dtype, device=pred_mean.device)
     residuals = x - pred_mean
-    log_prob = -0.5 * (np.log(2 * np.pi) + 2 * torch.log(sigma_tensor) + (residuals / sigma_tensor) ** 2)
-    return torch.sum(log_prob)
+    log_prob = -0.5 * (np.log(2 * np.pi) -  (1/2)* torch.log(sigma_tensor**2) -  0.5*(residuals / sigma_tensor) ** 2)
+    
+    ## use torch .distributions.Normal for numerical stability
+    #log_prob = Normal(loc=torch.zeros_like(pred_mean), scale=sigma_tensor).log_prob(residuals)
+    return torch.sum(log_prob) #  x.shape[0]  # Average over batch
 
 def scores(z: torch.Tensor, alpha: float) -> torch.Tensor:
     u, v = z[..., 0], z[..., 1]
@@ -103,7 +106,7 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
 
     h_mean = gumbel_acyclic_constr_mc(z, d, hparams)
     grad_h_mc = torch.autograd.grad(h_mean, z)[0]
-    grad_log_z_prior_total = -beta * grad_h_mc - z / sigma_z_sq
+    grad_log_z_prior_total = -beta * grad_h_mc - (z / sigma_z_sq)
 
     # --- Part 2: Likelihood Gradient ---
     
@@ -120,9 +123,14 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
     log_p = torch.stack(log_density_samples)
 
     log_sum = torch.logsumexp(log_p, dim=0)
+    log_sum = log_sum - torch.log(n_samples_tensor)
+
+    grad_ll, =  torch.autograd.grad(log_sum, z)
+
+    grad_lik = torch.exp(grad_ll - log_sum)  
     
     # Compute the gradient directly on log_sum. This avoids the unstable exp() and division.
-    grad_lik, = torch.autograd.grad(log_sum, z)
+    #grad_lik, = torch.autograd.grad(log_sum, z)
 
 
     if z.grad is not None:
@@ -203,22 +211,24 @@ def grad_theta_log_joint(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, A
     log_density_samples = []
     grad_samples = []
     for _ in range(n_samples):
-        g_soft = bernoulli_soft_gmat(z, hparams)
+        #g_soft = bernoulli_soft_gmat(z, hparams)
         #print(f"g_soft values: {g_soft}")
-        g_hard = torch.bernoulli(g_soft)
+        #g_hard = torch.bernoulli(g_soft)
         #print(f"g_hard values: {g_hard}")
 
         # tryign with gumbel to be consistent with grad z and gumbel mc acylci impelmentation
-        #g_soft = gumbel_soft_gmat(z, hparams)
+        g_soft = gumbel_soft_gmat(z, hparams)
 
 
 
 
-
-        log_lik_val = log_full_likelihood(data, g_hard, theta, hparams)
-        theta_eff = theta * g_hard
+        log_lik_val = log_full_likelihood(data, g_soft, theta, hparams)
+        theta_eff = theta * g_soft
         log_theta_prior_val = log_theta_prior(theta_eff, hparams.get('theta_prior_sigma', 1.0))
-        #print(f"Grad_theta mc_samples Log likelihood:  {log_lik_val} Log theta prior: \n {log_theta_prior_val} \n ")
+        ll_grad, = torch.autograd.grad(log_lik_val, theta, retain_graph=True)
+        log_theta_prior_grad, = torch.autograd.grad(log_theta_prior_val, theta , retain_graph=True)
+        #print(f"ll_grad shape: {ll_grad.shape}, values: {ll_grad}")
+        #print(f"log_theta_prior_grad shape: {log_theta_prior_grad.shape}, values: {log_theta_prior_grad}")
 
         current_log_density = log_lik_val + log_theta_prior_val
         current_grad ,= torch.autograd.grad(current_log_density, theta)
@@ -270,28 +280,23 @@ def log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparams: Di
     return log_lik + log_prior_z + log_prior_theta
 
 def update_dibs_hparams(hparams: Dict[str, Any], t_step: float) -> Dict[str, Any]:
-    t = max(t_step, 1.0) # Ensure t is at least 1
+    t = max(t_step, 1.0)
 
 
-    beta_max = 2000.0
-    beta_tau = 50         # iterations until β≈0.95*beta_max
-    #hparams['beta'] = beta_max * (1 - np.exp(-t/beta_tau))
-    #hparams['beta'] = hparams['beta_base'] * 0.2 * t
+    max_beta = 2000.0
+    total_steps = hparams.get('total_steps')  
+    hparams['beta'] = max_beta * (t_step / total_steps)
 
-    # Linear annealing for beta
-    #hparams['beta'] = hparams['beta_base'] + (t - 1) * 0.2 # Adjust the step size as needed
+    # Option 1: A very slow linear anneal, as suggested by the paper's table.
+    initial_alpha = 1.0
+    final_alpha = 10.0
+    alpha_anneal_start_step = total_steps // 10
 
-    # Your alpha annealing
-    #hparams['alpha'] = hparams['alpha_base'] * 0.2 * t
-    
-    beta_max = 2000.0  # Set a reasonable maximum
-    beta_tau = 1000
-    hparams['beta'] = beta_max * (1 - np.exp(-t_step / beta_tau))
-    
-    # Anneal alpha (sharpness) even more slowly. Start it later if needed.
-    alpha_max = 10.0
-    alpha_tau = 2000
-    hparams['alpha'] = alpha_max * (1 - np.exp(-t_step / alpha_tau))
+    if t_step < alpha_anneal_start_step:
+        hparams['alpha'] = initial_alpha
+    else:
+        progress = (t_step - alpha_anneal_start_step) / (total_steps - alpha_anneal_start_step)
+        hparams['alpha'] = initial_alpha + (final_alpha - initial_alpha) * progress
 
 
 
