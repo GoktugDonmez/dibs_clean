@@ -12,7 +12,8 @@ log = logging.getLogger(__name__)
 def log_gaussian_likelihood(x: torch.Tensor, pred_mean: torch.Tensor, sigma: float = 0.1) -> torch.Tensor:
     sigma_tensor = torch.tensor(sigma, dtype=pred_mean.dtype, device=pred_mean.device)
     residuals = x - pred_mean
-    log_prob = -0.5 * (np.log(2 * np.pi) + 2 * torch.log(sigma_tensor) + (residuals / sigma_tensor) ** 2)
+    # log_prob = -0.5 * (np.log(2 * np.pi) + 2 * torch.log(sigma_tensor) + (residuals / sigma_tensor) ** 2)
+    log_prob = -0.5 * (torch.log(2 * torch.pi * sigma_tensor**2)) - 0.5 * ((residuals / sigma_tensor)**2)
     return torch.sum(log_prob)
 
 def scores(z: torch.Tensor, alpha: float) -> torch.Tensor:
@@ -55,7 +56,7 @@ def gumbel_soft_gmat(z: torch.Tensor,
     return g_soft * mask
 
 def log_full_likelihood(data: Dict[str, Any], soft_gmat: torch.Tensor, theta: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
-    ## TODO: Expert belief: update this to use interventions, change the full likelihood 
+    ## TODO: Expert belief: update this to use interventions, change the full likelihood
     # and also add log bernoulli likelihood calculatior
     x_data = data['x']
     effective_W = theta * soft_gmat
@@ -70,24 +71,25 @@ def gumbel_acyclic_constr_mc(z: torch.Tensor, d: int, hparams: Dict[str, Any]) -
     h_samples = []
     for _ in range(hparams['n_nongrad_mc_samples']):
         # FOR NOW, JUST GIVE THE SOFT MATRIX, AND BY ANNEALING IT TO HARD MATRIX
-        g_soft = gumbel_soft_gmat(z, hparams)
+        g_soft = (gumbel_soft_gmat(z, hparams) > 0.5).float()
         h_samples.append(acyclic_constr(g_soft, d))
-        
-        # should gumbel soft gmat to hard gmat be done with >0.5 or with a sigmoid?  
-        # g_hard = torch.bernoulli(g_soft) ? 
+
+        # should gumbel soft gmat to hard gmat be done with >0.5 or with a sigmoid?
+        # g_hard = torch.bernoulli(g_soft) ?
         #g_hard = (g_soft > 0.5).float()
         #how about this  mentioned in dibs       g_ST   = g_hard + (g_soft - g_soft.detach())   # straight-through
-        
+
         #TODO fix above
         # for now use g_soft
-        
+
         ### STRAIGHT THROUGH
         #g_hard = (g_soft > 0.5).float()  # Convert to hard graph
-        #g_ST = g_hard + (g_soft - g_soft.detach()) 
+        #g_ST = g_hard + (g_soft - g_soft.detach())
         #h_samples.append(acyclic_constr(g_ST, d))
     h_samples = torch.stack(h_samples)
 
 
+    print(torch.mean(h_samples, dim=0))
     return torch.mean(h_samples, dim=0)
 
 def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, Any], hparams: Dict[str, Any]) -> torch.Tensor:
@@ -103,10 +105,10 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
 
     h_mean = gumbel_acyclic_constr_mc(z, d, hparams)
     grad_h_mc = torch.autograd.grad(h_mean, z)[0]
-    grad_log_z_prior_total = -beta * grad_h_mc - z / sigma_z_sq
+    grad_log_z_prior_total = -beta * grad_h_mc - (z / sigma_z_sq)
 
     # --- Part 2: Likelihood Gradient ---
-    
+
     log_density_samples = []
     for _ in range(hparams['n_grad_mc_samples']):
         g_soft = gumbel_soft_gmat(z, hparams)
@@ -120,7 +122,7 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
     log_p = torch.stack(log_density_samples)
 
     log_sum = torch.logsumexp(log_p, dim=0)
-    
+
     # Compute the gradient directly on log_sum. This avoids the unstable exp() and division.
     grad_lik, = torch.autograd.grad(log_sum, z)
 
@@ -128,9 +130,9 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
     if z.grad is not None:
         z.grad.zero_()
     z.requires_grad_(False)
-    
+
     # Final combined gradient
-    
+
 
 
 
@@ -174,7 +176,7 @@ def logsumexp_v1(log_tensor: torch.Tensor) -> torch.Tensor:
     M = log_tensor.shape[0]
     logM = torch.log(torch.tensor(M, dtype=log_tensor.dtype, device=log_tensor.device))
 
-    
+
     log_sum_exp = torch.logsumexp(log_tensor, dim=0)
 
     total = log_sum_exp - logM
@@ -222,7 +224,7 @@ def grad_theta_log_joint(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, A
 
         current_log_density = log_lik_val + log_theta_prior_val
         current_grad ,= torch.autograd.grad(current_log_density, theta)
-        log_density_samples.append(current_log_density) 
+        log_density_samples.append(current_log_density)
 
         grad_samples.append(current_grad)
     #print(f" END OF Grad_theta mc_samples, iter number: {hparams.get('current_iteration',1)}  \n")
@@ -248,7 +250,7 @@ def grad_log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparam
 
     grad_z = grad_z_log_joint_gumbel(z, theta.detach(), data, hparams)
     grad_theta = grad_theta_log_joint(z.detach(), theta, data, hparams)
-    
+
     return {"z": grad_z, "theta": grad_theta}
 
 def log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparams: Dict[str, Any]) -> torch.Tensor:
@@ -263,10 +265,10 @@ def log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparams: Di
     expected_h_val = gumbel_acyclic_constr_mc(z, d, hparams_updated)
     log_prior_z_acyclic = -hparams_updated['beta'] * expected_h_val
     log_prior_z = log_prior_z_gaussian + log_prior_z_acyclic
-    
+
     theta_eff = theta * g_soft
     log_prior_theta = log_theta_prior(theta_eff, hparams_updated.get('theta_prior_sigma', 1.0))
-    
+
     return log_lik + log_prior_z + log_prior_theta
 
 def update_dibs_hparams(hparams: Dict[str, Any], t_step: float) -> Dict[str, Any]:
@@ -283,11 +285,11 @@ def update_dibs_hparams(hparams: Dict[str, Any], t_step: float) -> Dict[str, Any
 
     # Your alpha annealing
     #hparams['alpha'] = hparams['alpha_base'] * 0.2 * t
-    
+
     beta_max = 2000.0  # Set a reasonable maximum
     beta_tau = 1000
     hparams['beta'] = beta_max * (1 - np.exp(-t_step / beta_tau))
-    
+
     # Anneal alpha (sharpness) even more slowly. Start it later if needed.
     alpha_max = 10.0
     alpha_tau = 2000
