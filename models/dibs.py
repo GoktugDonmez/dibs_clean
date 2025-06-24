@@ -11,12 +11,14 @@ log = logging.getLogger(__name__)
 
 def log_gaussian_likelihood(x: torch.Tensor, pred_mean: torch.Tensor, sigma: float = 0.1) -> torch.Tensor:
     sigma_tensor = torch.tensor(sigma, dtype=pred_mean.dtype, device=pred_mean.device)
-    residuals = x - pred_mean
-    log_prob = -0.5 * (np.log(2 * np.pi) -  (1/2)* torch.log(sigma_tensor**2) -  0.5*(residuals / sigma_tensor) ** 2)
     
-    ## use torch .distributions.Normal for numerical stability
-    #log_prob = Normal(loc=torch.zeros_like(pred_mean), scale=sigma_tensor).log_prob(residuals)
-    return torch.sum(log_prob) #  x.shape[0]  # Average over batch
+    #residuals = x - pred_mean
+    #old incorrect log_prob = -0.5 * (np.log(2 * np.pi) -  (1/2)* torch.log(sigma_tensor**2) -  0.5*(residuals / sigma_tensor) ** 2) old
+    #log_prob = -0.5 * (torch.log(2 * torch.pi * sigma_tensor**2)) - 0.5 * ((residuals / sigma_tensor)**2)
+    normal_dist = Normal(loc=pred_mean, scale=sigma_tensor)
+    log_prob = normal_dist.log_prob(x)
+
+    return torch.sum(log_prob)
 
 def scores(z: torch.Tensor, alpha: float) -> torch.Tensor:
     u, v = z[..., 0], z[..., 1]
@@ -77,17 +79,20 @@ def gumbel_acyclic_constr_mc(z: torch.Tensor, d: int, hparams: Dict[str, Any]) -
         h_samples.append(acyclic_constr(g_soft, d))
         
         # should gumbel soft gmat to hard gmat be done with >0.5 or with a sigmoid?  
-        # g_hard = torch.bernoulli(g_soft) ? 
+        #print(f'g_soft shape: {g_soft.shape}, values: \n {g_soft}')
+        #if hparams['current_iteration'] % 1 == 0:
+        #    print(f'g_soft shape: {g_soft.shape}, values: \n {g_soft}')
+        #g_hard = torch.bernoulli(g_soft)
+        #if hparams['current_iteration'] % 1 == 0:
+        #    print(f'g_hard shape: {g_hard.shape}, values: \n {g_hard}')
+        #print(f'g_hard shape: {g_hard.shape}, values: \n {g_hard}')
+        #h_samples.append(acyclic_constr(g_hard, d))
         #g_hard = (g_soft > 0.5).float()
         #how about this  mentioned in dibs       g_ST   = g_hard + (g_soft - g_soft.detach())   # straight-through
         
         #TODO fix above
         # for now use g_soft
         
-        ### STRAIGHT THROUGH
-        #g_hard = (g_soft > 0.5).float()  # Convert to hard graph
-        #g_ST = g_hard + (g_soft - g_soft.detach()) 
-        #h_samples.append(acyclic_constr(g_ST, d))
     h_samples = torch.stack(h_samples)
 
 
@@ -123,14 +128,14 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
     log_p = torch.stack(log_density_samples)
 
     log_sum = torch.logsumexp(log_p, dim=0)
-    log_sum = log_sum - torch.log(n_samples_tensor)
+    #log_sum = log_sum - torch.log(n_samples_tensor)
 
-    grad_ll, =  torch.autograd.grad(log_sum, z)
+    #grad_ll, =  torch.autograd.grad(log_sum, z)
 
-    grad_lik = torch.exp(grad_ll - log_sum)  
+    #grad_lik = torch.exp(grad_ll - log_sum)  
     
     # Compute the gradient directly on log_sum. This avoids the unstable exp() and division.
-    #grad_lik, = torch.autograd.grad(log_sum, z)
+    grad_lik, = torch.autograd.grad(log_sum, z)
 
 
     if z.grad is not None:
@@ -211,19 +216,19 @@ def grad_theta_log_joint(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, A
     log_density_samples = []
     grad_samples = []
     for _ in range(n_samples):
-        #g_soft = bernoulli_soft_gmat(z, hparams)
+        g_soft = bernoulli_soft_gmat(z, hparams)
         #print(f"g_soft values: {g_soft}")
-        #g_hard = torch.bernoulli(g_soft)
+        g_hard = torch.bernoulli(g_soft)
         #print(f"g_hard values: {g_hard}")
 
         # tryign with gumbel to be consistent with grad z and gumbel mc acylci impelmentation
-        g_soft = gumbel_soft_gmat(z, hparams)
+        #g_soft = gumbel_soft_gmat(z, hparams)
 
 
 
 
-        log_lik_val = log_full_likelihood(data, g_soft, theta, hparams)
-        theta_eff = theta * g_soft
+        log_lik_val = log_full_likelihood(data, g_hard, theta, hparams)
+        theta_eff = theta * g_hard
         log_theta_prior_val = log_theta_prior(theta_eff, hparams.get('theta_prior_sigma', 1.0))
         ll_grad, = torch.autograd.grad(log_lik_val, theta, retain_graph=True)
         log_theta_prior_grad, = torch.autograd.grad(log_theta_prior_val, theta , retain_graph=True)
@@ -280,23 +285,11 @@ def log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparams: Di
     return log_lik + log_prior_z + log_prior_theta
 
 def update_dibs_hparams(hparams: Dict[str, Any], t_step: float) -> Dict[str, Any]:
-    t = max(t_step, 1.0)
 
+    hparams['beta'] = hparams['beta_base'] * t_step # linear 
 
-    max_beta = 2000.0
-    total_steps = hparams.get('total_steps')  
-    hparams['beta'] = max_beta * (t_step / total_steps)
+    hparams['alpha'] = hparams['alpha_base'] * t_step * 0.2 # linear slope 0.2
 
-    # Option 1: A very slow linear anneal, as suggested by the paper's table.
-    initial_alpha = 1.0
-    final_alpha = 10.0
-    alpha_anneal_start_step = total_steps // 10
-
-    if t_step < alpha_anneal_start_step:
-        hparams['alpha'] = initial_alpha
-    else:
-        progress = (t_step - alpha_anneal_start_step) / (total_steps - alpha_anneal_start_step)
-        hparams['alpha'] = initial_alpha + (final_alpha - initial_alpha) * progress
 
 
 
