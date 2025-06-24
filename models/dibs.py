@@ -103,21 +103,21 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
     beta = hparams['beta']
     sigma_z_sq = hparams['sigma_z']**2
     theta_const = theta.detach()
-    n_samples_tensor = torch.tensor(float(hparams['n_grad_mc_samples']), device=z.device)
 
-    z.requires_grad_(True)
+    z_ = z.detach().clone().requires_grad_(True)
+    #z.requires_grad_(True)
     # --- Part 1: Prior Gradient ---
     # MC estimate of gradient of acyclicity constraint using Gumbel soft graphs
 
-    h_mean = gumbel_acyclic_constr_mc(z, d, hparams)
-    grad_h_mc = torch.autograd.grad(h_mean, z)[0]
-    grad_log_z_prior_total = -beta * grad_h_mc - (z / sigma_z_sq)
+    h_mean = gumbel_acyclic_constr_mc(z_, d, hparams)
+    grad_h_mc = torch.autograd.grad(h_mean, z_)[0]
+    grad_log_z_prior_total = -beta * grad_h_mc - (z_ / sigma_z_sq)
 
     # --- Part 2: Likelihood Gradient ---
     
     log_density_samples = []
     for _ in range(hparams['n_grad_mc_samples']):
-        g_soft = gumbel_soft_gmat(z, hparams)
+        g_soft = gumbel_soft_gmat(z_, hparams)  # z_ is detached and requires grad
 
         log_lik_val = log_full_likelihood(data, g_soft, theta_const, hparams)
         theta_eff_mc = theta_const * g_soft
@@ -127,7 +127,7 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
     #print(f'log_density_samples values: {log_density_samples}')
     log_p = torch.stack(log_density_samples)
 
-    log_sum = torch.logsumexp(log_p, dim=0)
+    log_sum = torch.logsumexp(log_p, dim=0) - torch.log(torch.tensor(hparams['n_grad_mc_samples'], device=z.device))
     #log_sum = log_sum - torch.log(n_samples_tensor)
 
     #grad_ll, =  torch.autograd.grad(log_sum, z)
@@ -135,23 +135,93 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
     #grad_lik = torch.exp(grad_ll - log_sum)  
     
     # Compute the gradient directly on log_sum. This avoids the unstable exp() and division.
-    grad_lik, = torch.autograd.grad(log_sum, z)
+    grad_lik, = torch.autograd.grad(log_sum, z_)
 
 
-    if z.grad is not None:
-        z.grad.zero_()
-    z.requires_grad_(False)
+    #if z.grad is not None:
+    #    z.grad.zero_()
+    #z.requires_grad_(False)
     
     # Final combined gradient
     
 
 
-
+    total = grad_log_z_prior_total + grad_lik
     # 3) Combine
     # ------------------------------------------------
-    return grad_log_z_prior_total + grad_lik
+    return total.detach()
 
 
+## SCORE BASED ESTIMATOR FOR GRADIENT Z 
+
+
+# ------------------------------------------------------------
+#  Score-function estimator for ∇_Z log p(Z,Θ | D)
+#  (Section B.2 of the paper, b = 0)
+# ------------------------------------------------------------
+def analytic_score_g_given_z(z, g, alpha):
+    # 1. logits and probabilities
+    logits = scores(z, alpha)          # shape (d,d)
+    probs  = torch.sigmoid(logits)     # σ(s_ij)
+
+    diff   = g - probs                 # (g_ij − σ(s_ij))
+
+    u, v   = z[..., 0], z[..., 1]      # (d,k)
+
+    # 2. gradients wrt u and v
+    grad_u = alpha * torch.einsum('ij,jk->ik', diff, v)   # (d,k)
+    grad_v = alpha * torch.einsum('ij,ik->jk', diff, u)   # (d,k)
+
+    return torch.stack([grad_u, grad_v], dim=-1)          # (d,k,2)
+
+
+def grad_z_log_joint_score(z: torch.Tensor,
+                           theta: torch.Tensor,
+                           data: Dict[str, Any],
+                           hparams: Dict[str, Any]) -> torch.Tensor:
+    """
+    ∇_Z log p(Z,Θ | D)  using the score-function (REINFORCE) estimator.
+
+    This replaces the Gumbel-soft estimator.
+    """
+    sigma_z2 = hparams['sigma_z'] ** 2
+    beta     = hparams['beta']
+
+    M = hparams['n_grad_mc_samples'] # M = 50
+    d = z.shape[0]                   # d = 4
+
+    with torch.no_grad():
+        probs = torch.sigmoid(scores(z, hparams["alpha"]))      # (d, d)
+        diag_mask = 1.0 - torch.eye(d, device=z.device)
+        probs = probs * diag_mask
+    
+    # Expand probs to (M, d, d) and sample M graphs at once
+    g_samples = torch.bernoulli(probs.expand(M, d, d))
+    # ---- likelihood part (Eq. 14, b = 0) ----------------------
+    log_terms = []
+    score_terms = []
+
+    theta_const = theta.detach()
+
+    for g in g_samples:
+        log_lik  = log_full_likelihood(data, g, theta_const, hparams)
+        theta_eff = theta_const * g
+        log_theta_prior_val = log_theta_prior(theta_eff, hparams.get('theta_prior_sigma', 1.0))
+
+        log_terms.append(log_lik + log_theta_prior_val)                 # scalar
+        score_terms.append(analytic_score_g_given_z(z, g, hparams['alpha']))
+
+    log_terms   = torch.stack(log_terms)          # (M,)
+    score_terms = torch.stack(score_terms)        # (M, d, k, 2)
+    grad_lik    = (log_terms.view(M, 1, 1, 1) * score_terms).mean(0)
+
+    # ---- Z-prior: Gaussian + acyclicity penalty --------------
+    z_ = z.detach().clone().requires_grad_(True)
+    h_mean = gumbel_acyclic_constr_mc(z_, d, hparams)       # differentiable w.r.t z_
+    grad_h, = torch.autograd.grad(h_mean, z_, retain_graph=False)
+    grad_prior = -beta * grad_h - z_ / sigma_z2
+
+    return (grad_lik + grad_prior).detach()
 
 
 
@@ -182,9 +252,9 @@ def weighted_grad(log_p: torch.Tensor,
 
 
 def grad_theta_log_joint(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, Any], hparams: Dict[str, Any]) -> torch.Tensor:
-    theta.requires_grad_(True)
+    #theta.requires_grad_(True)
     n_samples = hparams.get('n_grad_mc_samples', 1)
-    theta = theta.clone().detach().requires_grad_(True)
+    theta_ = theta.clone().detach().requires_grad_(True)
     log_density_samples = []
     grad_samples = []
     for _ in range(n_samples):
@@ -199,16 +269,16 @@ def grad_theta_log_joint(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, A
 
 
 
-        log_lik_val = log_full_likelihood(data, g_hard, theta, hparams)
-        theta_eff = theta * g_hard
+        log_lik_val = log_full_likelihood(data, g_hard, theta_, hparams)
+        theta_eff = theta_ * g_hard
         log_theta_prior_val = log_theta_prior(theta_eff, hparams.get('theta_prior_sigma', 1.0))
-        ll_grad, = torch.autograd.grad(log_lik_val, theta, retain_graph=True)
-        log_theta_prior_grad, = torch.autograd.grad(log_theta_prior_val, theta , retain_graph=True)
+        #ll_grad, = torch.autograd.grad(log_lik_val, theta_, retain_graph=True)
+        #log_theta_prior_grad, = torch.autograd.grad(log_theta_prior_val, theta_ , retain_graph=True)
         #print(f"ll_grad shape: {ll_grad.shape}, values: {ll_grad}")
         #print(f"log_theta_prior_grad shape: {log_theta_prior_grad.shape}, values: {log_theta_prior_grad}")
 
         current_log_density = log_lik_val + log_theta_prior_val
-        current_grad ,= torch.autograd.grad(current_log_density, theta)
+        current_grad ,= torch.autograd.grad(current_log_density, theta_)
         log_density_samples.append(current_log_density) 
 
         grad_samples.append(current_grad)
@@ -219,22 +289,21 @@ def grad_theta_log_joint(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, A
 
 
     # Cleanup
-    if theta.grad is not None:
-        theta.grad.zero_()
-    theta.requires_grad_(False)
+    #if theta.grad is not None:
+    #    theta.grad.zero_()
+    #theta.requires_grad_(False)
 
     grad =weighted_grad(log_p_tensor, grad_p_tensor)
     #grad = stable_gradient_estimator(log_p_tensor, grad_p_tensor)
     #print(f"Grad_theta shape: {grad.shape}, values: \n {grad}")
 
-    return  grad
+    return  grad.detach()
 
 
 def grad_log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparams: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-    z, theta = params['z'], params['theta']
-
-    grad_z = grad_z_log_joint_gumbel(z, theta.detach(), data, hparams)
-    grad_theta = grad_theta_log_joint(z.detach(), theta, data, hparams)
+    #grad_z = grad_z_log_joint_gumbel(params["z"], params["theta"].detach(), data, hparams)
+    grad_z = grad_z_log_joint_score(params["z"], params["theta"].detach(), data, hparams)
+    grad_theta = grad_theta_log_joint(params["z"].detach(), params["theta"], data, hparams)
     
     return {"z": grad_z, "theta": grad_theta}
 
@@ -273,7 +342,7 @@ def update_dibs_hparams(hparams: Dict[str, Any], t_step: float) -> Dict[str, Any
 
     hparams['beta'] = hparams['beta_base'] * t_step # linear 
 
-    hparams['alpha'] = hparams['alpha_base'] * t_step * 0.2 # linear slope 0.2
+    hparams['alpha'] = hparams['alpha_base'] * t_step * 0.02 # linear slope 0.2
 
 
 
