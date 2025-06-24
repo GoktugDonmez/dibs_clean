@@ -181,34 +181,6 @@ def weighted_grad(log_p: torch.Tensor,
 
 
 
-def logsumexp_v1(log_tensor: torch.Tensor) -> torch.Tensor:
-
-
-    M = log_tensor.shape[0]
-    logM = torch.log(torch.tensor(M, dtype=log_tensor.dtype, device=log_tensor.device))
-
-    
-    log_sum_exp = torch.logsumexp(log_tensor, dim=0)
-
-    total = log_sum_exp - logM
-    return total # torch.exp(total)
-
-def manual_stable_gradient(log_p_tensor: torch.Tensor, grad_p_tensor: torch.Tensor) -> torch.Tensor:
-# uses the logsumexp_v1 function to compute the stable gradient
-
-    print(f'log density values and shape: {log_p_tensor}, {log_p_tensor.shape}')
-    log_density_lse = torch.exp(torch.logsumexp(log_p_tensor, dim=0) - log_p_tensor.shape[0])  # logsumexp_v1(log_p_tensor)
-    # logsumexp_v1(log_p_tensor)
-    print(f'log density lse value: {log_density_lse}, shape: {log_density_lse.shape}')
-
-    print('-' * 50)
-    print(f'grad density values and shape: {grad_p_tensor}, {grad_p_tensor.shape}')
-    grad_lse = logsumexp_v1(grad_p_tensor)
-    print(f'grad density lse value: {grad_lse}, shape: {grad_lse.shape}')
-
-    return torch.exp(logsumexp_v1(grad_p_tensor) - logsumexp_v1(log_p_tensor)) # grad_lse / log_density_lse[:, None]
-
-
 def grad_theta_log_joint(z: torch.Tensor, theta: torch.Tensor, data: Dict[str, Any], hparams: Dict[str, Any]) -> torch.Tensor:
     theta.requires_grad_(True)
     n_samples = hparams.get('n_grad_mc_samples', 1)
@@ -281,6 +253,19 @@ def log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparams: Di
     
     theta_eff = theta * g_soft
     log_prior_theta = log_theta_prior(theta_eff, hparams_updated.get('theta_prior_sigma', 1.0))
+
+    if (hparams_updated['current_iteration'] > 850 and hparams_updated['current_iteration'] < 1200):
+        with torch.no_grad():
+            log_terms = {
+                "log_lik":      log_lik.item(),
+                "z_prior_gauss":log_prior_z_gaussian.item(),
+                "z_prior_acyc": log_prior_z_acyclic.item(),   # usually ≤ 0
+                "theta_prior":  log_prior_theta.item(),
+                "log_joint": log_lik + log_prior_theta + log_prior_z + log_prior_z_acyclic,
+                "penalty": -hparams_updated['beta'] * expected_h_val.item()
+            }
+        print(f"[dbg] {log_terms}")
+
     
     return log_lik + log_prior_z + log_prior_theta
 
