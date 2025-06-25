@@ -159,18 +159,15 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
 #  Score-function estimator for ∇_Z log p(Z,Θ | D)
 #  (Section B.2 of the paper, b = 0)
 # ------------------------------------------------------------
-def analytic_score_g_given_z(z, g, alpha):
+def analytic_score_g_given_z(z, g, hparams):
     # 1. logits and probabilities
-    logits = scores(z, alpha)          # shape (d,d)
-    probs  = torch.sigmoid(logits)     # σ(s_ij)
-
+    probs = bernoulli_soft_gmat(z, hparams)
     diff   = g - probs                 # (g_ij − σ(s_ij))
-
     u, v   = z[..., 0], z[..., 1]      # (d,k)
 
     # 2. gradients wrt u and v
-    grad_u = alpha * torch.einsum('ij,jk->ik', diff, v)   # (d,k)
-    grad_v = alpha * torch.einsum('ij,ik->jk', diff, u)   # (d,k)
+    grad_u = hparams['alpha'] * torch.einsum('ij,jk->ik', diff, v)   # (d,k)
+    grad_v = hparams['alpha'] * torch.einsum('ij,ik->jk', diff, u)   # (d,k)
 
     return torch.stack([grad_u, grad_v], dim=-1)          # (d,k,2)
 
@@ -189,33 +186,47 @@ def grad_z_log_joint_score(z: torch.Tensor,
 
     M = hparams['n_grad_mc_samples'] # M = 50
     d = z.shape[0]                   # d = 4
+    theta_const = theta
 
+
+    # 1. sample hard graphs 
     with torch.no_grad():
-        probs = torch.sigmoid(scores(z, hparams["alpha"]))      # (d, d)
-        diag_mask = 1.0 - torch.eye(d, device=z.device)
-        probs = probs * diag_mask
-    
-    # Expand probs to (M, d, d) and sample M graphs at once
-    g_samples = torch.bernoulli(probs.expand(M, d, d))
-    # ---- likelihood part (Eq. 14, b = 0) ----------------------
-    log_terms = []
-    score_terms = []
+        g_hard_samples = [torch.bernoulli(bernoulli_soft_gmat(z, hparams)) for _ in range(M)]
 
-    theta_const = theta.detach()
-
-    for g in g_samples:
-        log_lik  = log_full_likelihood(data, g, theta_const, hparams)
+    ll = []
+    scores = []
+    for g in g_hard_samples:
+        log_lik = log_full_likelihood(data, g, theta_const, hparams)
         theta_eff = theta_const * g
         log_theta_prior_val = log_theta_prior(theta_eff, hparams.get('theta_prior_sigma', 1.0))
+        
+        # log likelihood 
+        ll.append(log_lik + log_theta_prior_val)
+        
+        # score 
+        scores.append(analytic_score_g_given_z(z, g, hparams))
+    
+    log_p = torch.stack(ll)
+    grad_p = torch.stack(scores)
 
-        log_terms.append(log_lik + log_theta_prior_val)                 # scalar
-        score_terms.append(analytic_score_g_given_z(z, g, hparams['alpha']))
+    log_p_max = log_p.max()
+    log_p_shifted = log_p - log_p_max
+    
+    unnormalized_w = torch.exp(log_p_shifted)
+    w = unnormalized_w / unnormalized_w.sum()
+                     # (M,1,1,...)
 
-    log_terms   = torch.stack(log_terms)          # (M,)
-    score_terms = torch.stack(score_terms)        # (M, d, k, 2)
-    grad_lik    = (log_terms.view(M, 1, 1, 1) * score_terms).mean(0)
+    while w.dim() < grad_p.dim():
+        w = w.unsqueeze(-1)                    
+    
+    ## compute the weighted avg 
+    grad_lik = (w * grad_p).sum(dim=0)
+
+
+
 
     # ---- Z-prior: Gaussian + acyclicity penalty --------------
+    # gumbel is possible cuz no differentiable function in expectation 
     z_ = z.detach().clone().requires_grad_(True)
     h_mean = gumbel_acyclic_constr_mc(z_, d, hparams)       # differentiable w.r.t z_
     grad_h, = torch.autograd.grad(h_mean, z_, retain_graph=False)
@@ -342,7 +353,7 @@ def update_dibs_hparams(hparams: Dict[str, Any], t_step: float) -> Dict[str, Any
 
     hparams['beta'] = hparams['beta_base'] * t_step # linear 
 
-    hparams['alpha'] = hparams['alpha_base'] * t_step * 0.02 # linear slope 0.2
+    hparams['alpha'] = hparams['alpha_base'] * t_step * 0.2 # linear slope 0.2
 
 
 
