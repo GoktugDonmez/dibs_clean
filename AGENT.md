@@ -8,6 +8,9 @@ This repository implements DiBS (Differentiable Bayesian Structure Learning).
 .
 ├── data/
 │   └── graph_data.py          # Data generation utilities
+|──debug/
+      -debug_notebook.ipynb experiments and changes made to the code will be done here
+      -dibs_debug.py same dibs model to be changed and tested for the debugging
 ├── models/
 │   ├── __init__.py
 │   ├── dibs.py               # Core DiBS implementation
@@ -38,10 +41,6 @@ This repository implements DiBS (Differentiable Bayesian Structure Learning).
    conda activate dibs_env
    ```
 
-3. **Install the package in development mode**
-   ```bash
-   pip install -e .
-   ```
 
 
 ## Usage
@@ -85,7 +84,7 @@ Then navigate to `http://localhost:5000` in your browser.
 
 ### Models
 - **DiBS Core**: Implementation of the DiBS algorithm
-- **Gradient Computation**: Stable gradient computation with logsumexp
+- **Gradient Computation**: Stable gradient computation with logsumexp problematic
 - **Constraint Handling**: Acyclicity constraints
 
 ### Training Loops
@@ -113,18 +112,6 @@ Core dependencies:
 
 ### Known Issues
 
-- **LogSumExp Stability**: correct logsumexp is needed for gradient calculations 
-- **Gradient theta and z update**:  both should be updated, the gradients are incorrect, possibly due to logsumexp
-- **Notes**: denominator for grad z log joint gumbell is always 1 
-
-be careful when adding clamps  or limits  remove them first then add if needed
-remove clamping errors and see if it does not work 
-
-look the log weights in sum exp  it is possibly the reasoing for exploding/vanishing gradients
-denominator is always 1  for the graz a and for both grad theta
-fix the gradients  be carefull on gumbell and bernoulli(deterministic) soft gmat,  look where when to use
-
-sampling definition(and the mc sampling loop structure and gumbell vs bernouilli) of the theta and z is little different due to reparametrization and the paper objectiev derivations given
-grad z  should be wrt to grad z  expecation gumbell (1 gradient taken  of the expectation after sampling)
-grad theta shoudl be wer the expectation then grad   (so take multiple gradients)
-
+- **LogSumExp Stability**: correct logsumexp is needed for gradient calculations are problematic
+- **Gradient theta and z update**:  both should be updated, the gradients are incorrect, 
+- **Positive log joint**: the log joint gives positive and very big values which it shuldnt have. Should test with a basic model the issues only wit related to likelihood function.
