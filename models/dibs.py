@@ -12,13 +12,16 @@ log = logging.getLogger(__name__)
 def log_gaussian_likelihood(x: torch.Tensor, pred_mean: torch.Tensor, sigma: float = 0.1) -> torch.Tensor:
     sigma_tensor = torch.tensor(sigma, dtype=pred_mean.dtype, device=pred_mean.device)
     
-    residuals = x - pred_mean
-    #old incorrect log_prob = -0.5 * (np.log(2 * np.pi) -  (1/2)* torch.log(sigma_tensor**2) -  0.5*(residuals / sigma_tensor) ** 2) old
-    log_prob = -0.5 * (torch.log(2 * torch.pi * sigma_tensor**2)) - 0.5 * ((residuals / sigma_tensor)**2)
-    #normal_dist = Normal(loc=pred_mean, scale=sigma_tensor)
-    #log_prob = normal_dist.log_prob(x)
+    ## USING THE LIB
+    normal_dist = Normal(loc=pred_mean, scale=sigma_tensor)
+    log_prob = normal_dist.log_prob(x).sum()
 
-    return torch.sum(log_prob)
+    ## USING THE LOG PROBABILITY FROM THE GAUSSIAN DISTRIBUTION
+    #residuals = x - pred_mean
+    #log_prob = -0.5 * (torch.log(2 * torch.pi * sigma_tensor**2)) - 0.5 * ((residuals / sigma_tensor)**2)
+
+
+    return log_prob
 
 def scores(z: torch.Tensor, alpha: float) -> torch.Tensor:
     u, v = z[..., 0], z[..., 1]
@@ -127,7 +130,7 @@ def grad_z_log_joint_gumbel(z: torch.Tensor, theta: torch.Tensor, data: Dict[str
         # 4. Calculate the gradient for this single sample.
         # We must use retain_graph=True because we are doing a backward pass
         # inside a loop, and PyTorch would otherwise free the graph memory.
-        grad, = torch.autograd.grad(log_density_one_sample, z, retain_graph=True)
+        grad, = torch.autograd.grad(log_density_one_sample, z)
         
         log_density_samples.append(log_density_one_sample)
         grad_samples.append(grad)
