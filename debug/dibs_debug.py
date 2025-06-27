@@ -85,7 +85,6 @@ def analytic_score_g_given_z(z, g, hparams):
 
 
 
-## TODO CHECK THE CODE
 def score_acyclic_constr_mc(z: torch.Tensor,  hparams: Dict[str, Any]) -> torch.Tensor:
     """
     score estimator for the acyclicity constraint
@@ -146,7 +145,7 @@ def grad_theta_score(z: torch.Tensor, data: Dict[str, Any], theta: torch.Tensor,
     Computes the gradient ∇_Θ log p(Z,Θ|D) using a self-normalized importance sampling
     estimator, which correctly implements the ratio formula from the DiBS paper.
     """
-    n_samples = hparams.get('n_grad_mc_samples', 64)
+    n_samples = hparams.get('n_mc_samples', 64)
     
     log_density_samples = []
     grad_samples = []
@@ -232,7 +231,7 @@ def update_dibs_hparams(hparams: Dict[str, Any], t: int) -> Dict[str, Any]:
     Handles annealing schedules for hyperparameters.
     """
     # Simple linear annealing
-    hparams['alpha'] = hparams['alpha_base'] * t *0.2
+    hparams['alpha'] = hparams['alpha_base'] * t *0.02
     hparams['beta'] = hparams['beta_base'] * t
     hparams['current_t'] = t
     return hparams
@@ -384,16 +383,16 @@ def generate_ground_truth_scale_free_data(num_samples, n_nodes, m_edges, obs_noi
 # =============================================================================
 
 class Config:
-    seed = 42
+    seed = 31
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # --- Data Generation ---
     # Choose data source: 'simple_chain', 'erdos_renyi', 'scale_free'
-    data_source = 'erdos_renyi'
+    data_source = 'scale_free'
     
     # --- Data Parameters ---
     d_nodes = 5
-    num_samples = 50
+    num_samples = 100
     obs_noise_std = 0.1
     
     # Parameters for 'simple_chain'
@@ -415,7 +414,7 @@ class Config:
     n_mc_samples = 64
 
     # --- Training ---
-    lr = 1e-3
+    lr = 5e-3
     num_iterations = 2000
     debug_print_iter = 100
 
