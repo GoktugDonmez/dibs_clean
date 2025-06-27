@@ -414,7 +414,7 @@ class Config:
     n_mc_samples = 64
 
     # --- Training ---
-    lr = 5e-3
+    lr = 1e-4
     num_iterations = 2000
     debug_print_iter = 100
 
