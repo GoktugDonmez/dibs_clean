@@ -71,6 +71,63 @@ def gumbel_acyclic_constr_mc(z: torch.Tensor, d: int, hparams: Dict[str, Any]) -
     """
     return "skip for now"
 
+import torch.nn.functional as F
+def score_autograd_g_given_z(z: torch.Tensor, g: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
+    logits = scores(z, hparams)
+    log_prob_g = F.binary_cross_entropy_with_logits(input=logits, target=g, reduction='sum')
+    score, = torch.autograd.grad(log_prob_g, z)
+    return score
+
+def grad_z_score_autograd(z: torch.Tensor, data: Dict[str, Any], theta: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
+    """
+    Computes ∇_z log p(z|D,Θ) using the score function estimator,
+    but calculates the score term `∇_z log q(g|z)` using torch.autograd.
+    """
+    d = z.shape[0]
+    n_samples = hparams.get('n_mc_samples', 64)
+
+    # --- Gradient of the Priors (Unaffected by the score function) ---
+    # Gradient of log p(z)
+    grad_z_prior = - (z / hparams['sigma_z']**2)
+
+    # --- Score Function Estimation Part ---
+    total_likelihood_score = 0
+    total_acyclicity_score = 0
+    
+    # Pre-compute probabilities to sample from
+    with torch.no_grad():
+        edge_probs = torch.sigmoid(scores(z, hparams))
+
+    for _ in range(n_samples):
+        # 1. Sample a hard graph G. This operation is non-differentiable.
+        g_hard = torch.bernoulli(edge_probs)
+
+        # 2. Calculate the score `∇_z log q(g|z)` using our new autograd function.
+        # This is the "manual gradient" part that we are automating.
+        score = score_autograd_g_given_z(z, g_hard, hparams)
+
+        # 3. Calculate the "rewards" for this sample G. These are treated as constants w.r.t. z.
+        with torch.no_grad():
+            # Likelihood and Theta prior reward
+            log_joint_reward = (log_full_likelihood(data, g_hard, theta, hparams) + 
+                                log_theta_prior(theta * g_hard, hparams.get('theta_prior_sigma')))
+            
+            # Acyclicity constraint reward
+            acyclicity_reward = acyclic_constr(g_hard, d)
+        
+        # 4. Multiply rewards by the score and accumulate.
+        total_likelihood_score += log_joint_reward * score
+        total_acyclicity_score += acyclicity_reward * score
+
+    # Average the estimators over the number of samples
+    grad_likelihood = total_likelihood_score / n_samples
+    grad_acyclicity = total_acyclicity_score / n_samples
+    
+    # Combine all gradient components for z
+    total_grad = grad_z_prior + grad_likelihood - (hparams['beta'] * grad_acyclicity)
+
+    return total_grad
+
 def analytic_score_g_given_z(z, g, hparams):
     # 1. logits and probabilities
     probs = soft_gmat(z, hparams)
@@ -130,10 +187,13 @@ def grad_z_score(z: torch.Tensor, data: Dict[str, Any], theta: torch.Tensor, hpa
         ## what should go here?  the full likelihood as the reward ?
         
         log_joint_reward  = log_full_likelihood(data, g_hard, theta, hparams)  + log_theta_prior(theta * g_hard, hparams.get('theta_prior_sigma'))
+        print(f"log_joint_reward: {log_joint_reward}")    
+        joint_reward = torch.exp(log_joint_reward)
+        print(f"joint_reward: {joint_reward}")
 
         score = analytic_score_g_given_z(z, g_hard, hparams)
 
-        total_likelihood_score += log_joint_reward * score
+        total_likelihood_score += joint_reward * score
     grad_likelihood = total_likelihood_score / n_samples
 
     total_grad = grad_prior + grad_likelihood
@@ -141,10 +201,6 @@ def grad_z_score(z: torch.Tensor, data: Dict[str, Any], theta: torch.Tensor, hpa
     return total_grad
 
 def grad_theta_score(z: torch.Tensor, data: Dict[str, Any], theta: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
-    """
-    Computes the gradient ∇_Θ log p(Z,Θ|D) using a self-normalized importance sampling
-    estimator, which correctly implements the ratio formula from the DiBS paper.
-    """
     n_samples = hparams.get('n_mc_samples', 64)
     
     log_density_samples = []
@@ -192,6 +248,7 @@ def grad_log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparam
     A top-level function that orchestrates the calculation of all gradients.
     """
     grad_z = grad_z_score(params["z"], data, params["theta"].detach(), hparams)
+    #grad_z = grad_z_score_autograd(params["z"], data, params["theta"].detach(), hparams)
     grad_th = grad_theta_score(params["z"].detach(), data, params["theta"], hparams)
     return grad_z, grad_th
 
@@ -222,7 +279,9 @@ def log_joint(params: Dict[str, Any], data: Dict[str, Any], hparams: Dict[str, A
     log_joint = log_likelihood_val + log_theta_prior_val + log_z_prior - hparams['beta'] * acyclicity_val
     logging.info(f"Log-joint: {log_joint.item():.4f}, "
                  f"Log-Likelihood: {log_likelihood_val.item():.4f}, "
+                 f"Log-Z-Prior: {log_z_prior.item():.4f}, "
                  f"Log-Theta-Prior: {log_theta_prior_val.item():.4f}, "
+                 f"penalty acylic: {-hparams['beta'] * acyclicity_val.item():.4f}, "
                  f"Acyclicity: {acyclicity_val.item():.4f}")
     return log_joint
 
@@ -250,16 +309,16 @@ def generate_ground_truth_chain_data(num_samples, chain_length, obs_noise_std):
     
     G_true = torch.zeros(chain_length, chain_length, dtype=torch.float32)
     for i in range(chain_length - 1):
-        if i == 0:
-            G_true[i, i + 1] = 2
-        elif i == 1:
-            G_true[i, i + 1] = -1.5
-        else: 
-            G_true[i, i + 1] = 1.0
+        G_true[i, i + 1] = 1.0
 
     Theta_true = torch.zeros(chain_length, chain_length, dtype=torch.float32)
     for i in range(chain_length - 1):
-        Theta_true[i, i + 1] = (torch.rand(1).item() - 0.5) * 4.0 # Random weight in [-2, 2]
+        if i==0:
+            Theta_true[i, i + 1] = 2
+        elif i==1:
+            Theta_true[i, i + 1] = -1.5
+        else:
+            Theta_true[i, i + 1] = (torch.rand(1).item() - 0.5) * 4.0 # Random weight in [-2, 2]
     
     X_data = torch.zeros(num_samples, chain_length)
     X_data[:, 0] = torch.randn(num_samples) * obs_noise_std
@@ -388,10 +447,10 @@ class Config:
     
     # --- Data Generation ---
     # Choose data source: 'simple_chain', 'erdos_renyi', 'scale_free'
-    data_source = 'scale_free'
+    data_source = 'simple_chain'
     
     # --- Data Parameters ---
-    d_nodes = 5
+    d_nodes = 3
     num_samples = 100
     obs_noise_std = 0.1
     
@@ -414,7 +473,7 @@ class Config:
     n_mc_samples = 64
 
     # --- Training ---
-    lr = 1e-4
+    lr = 5e-3
     num_iterations = 2000
     debug_print_iter = 100
 
@@ -423,6 +482,49 @@ cfg = Config()
 # =============================================================================
 # 4. TRAINING LOOP
 # =============================================================================
+def debug_prediction_error(
+    params: Dict[str, torch.Tensor], 
+    data: Dict[str, Any], 
+    hparams: Dict[str, Any],
+    G_true: torch.Tensor
+) -> None:
+    """
+    Calculates and logs key metrics related to prediction accuracy and the error penalty.
+    """
+    log.info("--- Prediction Error Debug ---")
+    
+    # Ensure we are not tracking gradients here
+    with torch.no_grad():
+        # --- 1. Get the model's current best estimate of the graph and weights ---
+        z, theta = params["z"], params["theta"]
+        x_data = data['x']
+        sigma_obs = hparams['sigma_obs_noise']
+
+        # Get the hard graph the model is currently predicting
+        g_probs = soft_gmat(z, hparams)
+        g_learned = torch.bernoulli(g_probs)
+        
+        # Calculate the effective weights based on the learned graph
+        W_learned = theta * g_learned
+        
+        # --- 2. Make predictions based on the learned model ---
+        pred_mean = torch.matmul(x_data, W_learned)
+        
+        # --- 3. Calculate error metrics ---
+        residuals = x_data - pred_mean
+        mse = torch.mean(residuals**2)  
+        mae = torch.mean(torch.abs(residuals))
+        
+        # --- 4. Calculate the Error Penalty directly ---
+        # This should match the value we derived from the log-likelihood
+        total_error_penalty = torch.sum(residuals**2) / (2 * sigma_obs**2)
+        
+        # --- 5. Compare learned graph to ground truth ---
+        shd = torch.sum(torch.abs(g_learned.cpu() - G_true.cpu()))
+
+        log.info(f"SHD: {shd.item():.1f} | MSE: {mse.item():.6f} | MAE: {mae.item():.6f}")
+        log.info(f"Target MSE (noise variance σ^2): {sigma_obs**2:.6f}")
+        log.info(f"Calculated Total Error Penalty: {total_error_penalty.item():.2f}")
 
 def main():
     # --- Setup ---
@@ -511,6 +613,9 @@ def main():
 
         # --- Logging ---
         if t % cfg.debug_print_iter == 0 or t == cfg.num_iterations:
+            debug_prediction_error(particle, data, hparams, G_true) 
+
+
             with torch.no_grad():
                 lj_val = log_joint(particle, data, hparams).item()
                 grad_z_norm = torch.linalg.norm(grad_z).item()
