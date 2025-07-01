@@ -136,73 +136,44 @@ def grad_z_score_autograd_softmax(z: torch.Tensor,
     return grad_z_prior + grad_like - hparams['beta'] * grad_acyc
 
 
-def grad_z_score_autograd_stable(z: torch.Tensor, data: Dict[str, Any], theta: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
-    """
-    Computes ∇_z log p(z|D,Θ) using the score function estimator with stable computation
-    for the log-likelihood part.
-    """
-    d = z.shape[0]
-    n_samples = hparams.get('n_mc_samples', 64)
+def grad_z_score_autograd_stable(z, data, theta, hparams):
+    d         = z.size(0)
+    S         = hparams.get('n_mc_samples', 64)
+    sigma_z   = hparams['sigma_z']
+    beta      = hparams['beta']
 
-    # --- Gradient of the Priors (Unaffected by the score function) ---
-    grad_z_prior = -(z / hparams['sigma_z']**2)
+    # ---- prior term ---------------------------------------------------------
+    grad_z  = -z / sigma_z**2                     # (d, k, 2)
 
-    # --- Score Function Estimation Part ---
-    log_joint_rewards = []
-    scores_list = []
-    
-    # Pre-compute probabilities to sample from
+    # ---- sample graphs ------------------------------------------------------
     with torch.no_grad():
-        edge_probs = torch.sigmoid(scores(z, hparams))
+        edge_probs = torch.sigmoid(scores(z, hparams))   # (d, d)
+    g_samples = torch.bernoulli(edge_probs.expand(S, -1, -1))  # (S, d, d)
 
-    for _ in range(n_samples):
-        # 1. Sample a hard graph G
-        g_hard = torch.bernoulli(edge_probs)
+    # ---- score ∇_z log q(G|z) for every sample ------------------------------
+    score_z   = torch.stack([
+        score_autograd_g_given_z(z, g, hparams) for g in g_samples
+    ])                                           # (S, d, k, 2)
 
-        # 2. Calculate the score ∇_z log q(g|z)
-        score = score_autograd_g_given_z(z, g_hard, hparams)
+    # ---- log joint reward ---------------------------------------------------
+    with torch.no_grad():
+        log_r = torch.stack([
+            log_full_likelihood(data, g, theta, hparams) +
+            log_theta_prior(theta * g, hparams['theta_prior_sigma'])
+            for g in g_samples
+        ])                                       # (S,)
 
-        # 3. Calculate log joint reward
-        with torch.no_grad():
-            log_joint_reward = (log_full_likelihood(data, g_hard, theta, hparams) + 
-                               log_theta_prior(theta * g_hard, hparams.get('theta_prior_sigma')))
-            
-        log_joint_rewards.append(log_joint_reward)
-        scores_list.append(score)
+    # ---- likelihood gradient via soft-max weights ---------------------------
+    w = torch.softmax(log_r, dim=0)              # (S,)
+    grad_lik = (w.view(-1,1,1,1) * score_z).sum(dim=0)
 
-    # Convert to tensors
-    log_joint_tensor = torch.stack(log_joint_rewards)  # (n_samples,)
-    scores_tensor = torch.stack(scores_list)           # (n_samples, d, k, 2)
-    
-    # --- STABLE LIKELIHOOD GRADIENT COMPUTATION ---
-    # Use logsumexp trick for numerical stability
-    log_rewards_max = torch.max(log_joint_tensor)
-    log_rewards_shifted = log_joint_tensor - log_rewards_max
-    p_shifted = torch.exp(log_rewards_shifted)
-    weights = p_shifted / p_shifted.sum()  # Normalized weights that sum to 1
-    
-    # Compute weighted gradient (this replaces the /n_samples averaging)
-    grad_likelihood = torch.zeros_like(scores_tensor[0])
-    for i in range(n_samples):
-        grad_likelihood += weights[i] * scores_tensor[i]
-    
-    # --- Acyclicity part (keeping original simple averaging) ---
-    total_acyclicity_score = 0
-    for _ in range(n_samples):
-        g_hard = torch.bernoulli(edge_probs)
-        score = score_autograd_g_given_z(z, g_hard, hparams)
-        
-        with torch.no_grad():
-            acyclicity_reward = acyclic_constr(g_hard, d)
-        
-        total_acyclicity_score += acyclicity_reward * score
+    # ---- acyclicity term ----------------------------------------------------
+    with torch.no_grad():
+        r_cyc = torch.stack([acyclic_constr(g, d) for g in g_samples])  # (S,)
+    grad_cyc = (r_cyc.view(-1,1,1,1) * score_z).mean(dim=0)
 
-    grad_acyclicity = total_acyclicity_score / n_samples
-    
-    # Combine all gradient components
-    total_grad = grad_z_prior + grad_likelihood - (hparams['beta'] * grad_acyclicity)
-
-    return total_grad
+    # ---- total --------------------------------------------------------------
+    return grad_z + grad_lik - beta * grad_cyc
 
 
 def grad_z_score_autograd(z: torch.Tensor, data: Dict[str, Any], theta: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
@@ -225,6 +196,8 @@ def grad_z_score_autograd(z: torch.Tensor, data: Dict[str, Any], theta: torch.Te
     with torch.no_grad():
         edge_probs = torch.sigmoid(scores(z, hparams))
 
+    log_density_samples = []
+    score_samples = []
     for _ in range(n_samples):
         # 1. Sample a hard graph G. This operation is non-differentiable.
         g_hard = torch.bernoulli(edge_probs)
@@ -243,17 +216,118 @@ def grad_z_score_autograd(z: torch.Tensor, data: Dict[str, Any], theta: torch.Te
             acyclicity_reward = acyclic_constr(g_hard, d)
         
         # 4. Multiply rewards by the score and accumulate.
-        total_likelihood_score += log_joint_reward * score
+        log_density_samples.append(log_joint_reward)
+        score_samples.append(score)
         total_acyclicity_score += acyclicity_reward * score
 
-    # Average the estimators over the number of samples
-    grad_likelihood = total_likelihood_score / n_samples
+    # grad acyclicity  normal avg
     grad_acyclicity = total_acyclicity_score / n_samples
     
+    # grad likelihood soft-max
+    log_density_samples = torch.stack(log_density_samples)
+    score_samples = torch.stack(score_samples)
+    w = torch.softmax(log_density_samples, dim=0)
+    grad_likelihood = (w.view(-1,1,1,1) * score_samples).sum(dim=0)
+
     # Combine all gradient components for z
     total_grad = grad_z_prior + grad_likelihood - (hparams['beta'] * grad_acyclicity)
 
     return total_grad
+
+import torch, math
+from typing import Dict, Any
+
+# ---------- helper: SciPy-style logsumexp with sign ----------
+def logsumexp_with_sign(a: torch.Tensor,
+                        b: torch.Tensor,
+                        dim: int = -1,
+                        keepdim: bool = False,
+                        eps: float = 1e-40):
+    """
+    Stable log|Σ b·exp(a)|  and  sign(Σ b·exp(a))
+
+    Parameters
+    ----------
+    a : Tensor   – log-terms  (broadcastable to `b`)
+    b : Tensor   – weights (can be ±)
+    dim : int    – reduction dimension
+    keepdim : bool – keep reduced dimension
+    """
+    a_max = torch.max(a, dim=dim, keepdim=True)[0]            # shift
+    scaled = b * torch.exp(a - a_max)                         # safe range
+    s      = scaled.sum(dim=dim, keepdim=keepdim)             # may be ±
+    sign   = torch.sign(s).detach()                           # ±1 (no grad)
+    logabs = torch.log(torch.abs(s) + eps) + a_max.squeeze(dim) \
+             if not keepdim else torch.log(torch.abs(s) + eps) + a_max
+    return logabs, sign
+# -------------------------------------------------------------
+
+
+def grad_z_score_stable_sign(z: torch.Tensor,
+                             data: Dict[str, Any],
+                             theta: torch.Tensor,
+                             hparams: Dict[str, Any]) -> torch.Tensor:
+    """
+    Stable score-function estimator for ∇_z log p(z | D, Θ) that keeps
+    track of the sign of the numerator (needed when individual score
+    components can be negative).
+    """
+    d          = z.shape[0]
+    K          = hparams.get('n_mc_samples', 64)
+
+    # ---- 1.  prior gradient (∇ log p(z)) --------------------
+    grad_z_prior = - z / hparams['sigma_z']**2
+
+    # ---- 2.  Monte-Carlo loop ------------------------------
+    with torch.no_grad():
+        edge_probs = torch.sigmoid(scores(z, hparams))        # Bernoulli probs
+
+    log_lik   = []        # ℓ_j
+    score_raw = []        # b_j  (tensor shaped like z)
+    tot_acycl = 0.0
+
+    for _ in range(K):
+        g_hard = torch.bernoulli(edge_probs)
+        #   score w.r.t. z for *this* graph
+        score   = score_autograd_g_given_z(z, g_hard, hparams)
+
+        with torch.no_grad():
+            ll = (log_full_likelihood(data, g_hard, theta, hparams) +
+                  log_theta_prior(theta * g_hard,
+                                  hparams.get('theta_prior_sigma')))
+            h  = acyclic_constr(g_hard, d)
+
+        log_lik.append(ll)
+        score_raw.append(score)
+        tot_acycl += h * score        # accumulate β∇h
+
+    # ------------ stack tensors ------------------------------
+    log_lik   = torch.stack(log_lik)            # [K]
+    score_raw = torch.stack(score_raw)          # [K, *z.shape]
+
+    # acyclicity term (simple average)
+    grad_acycl = tot_acycl / K
+
+    # ------------ stable numerator / denominator -------------
+    flat_dim   = score_raw[0].numel()           # d*k*2
+    scores_f   = score_raw.view(K, flat_dim).T  # [flat_dim, K]
+    log_lik_b  = log_lik.unsqueeze(0)           # broadcast: [1,K] → [flat_dim,K]
+
+    log_num, sign = logsumexp_with_sign(log_lik_b, scores_f, dim=1)  # per coord
+    log_den       = torch.logsumexp(log_lik, dim=0)                  # scalar
+
+    # N/D   (K cancels, but keep it to mirror JAX algebra)
+    grad_lik_flat = sign * torch.exp(log_num - math.log(K) -
+                                     log_den + math.log(K))
+
+    grad_lik = grad_lik_flat.view_as(score_raw[0])        # [d,k,2]
+
+    # ------------ final combined gradient --------------------
+    beta      = hparams['beta']
+    total_grad = grad_z_prior + grad_lik - beta * grad_acycl
+
+    return total_grad
+
 
 def analytic_score_g_given_z(z, g, hparams):
     # 1. logits and probabilities
@@ -406,6 +480,60 @@ def grad_theta_score(z: torch.Tensor, data: Dict[str, Any], theta: torch.Tensor,
 
     return final_grad    
 
+def grad_theta_score_stable_sign(z:      torch.Tensor,
+                                 data:   Dict[str, Any],
+                                 theta:  torch.Tensor,
+                                 hparams: Dict[str, Any]) -> torch.Tensor:
+    """
+    Sign-stable score-function estimator for ∇_Θ log p(z,Θ | D).
+
+    * Draw K graphs   G₁…G_K  ~  p(G | z)        (hard Bernoulli here)
+    * For each graph compute
+        ℓ_j  = log p(D,Θ | G_j)                  (log-likelihood term)
+        b_j  = ∇_Θ ℓ_j                           (gradient wrt Θ)
+    * Return   E_{p(G|z,D)} [ b_j ]
+              = Σ b_j · e^{ℓ_j}  /  Σ e^{ℓ_j},
+      with all numerator components evaluated stably in log-space.
+    """
+    K = hparams.get('n_mc_samples', 64)
+    d = theta.size(0)
+
+    log_lik_list, grad_list = [], []
+
+    for _ in range(K):
+        # ---- 1. sample hard graph ----------------------------------------
+        with torch.no_grad():
+            G = torch.bernoulli(soft_gmat(z, hparams))
+
+        # ---- 2. log-density  ℓ_j  ----------------------------------------
+        theta_tmp = theta.clone().requires_grad_(True)
+        log_j = (log_full_likelihood(data, G, theta_tmp, hparams) +
+                 log_theta_prior(theta_tmp * G,
+                                 hparams['theta_prior_sigma']))
+        # ---- 3. gradient wrt Θ   b_j  ------------------------------------
+        grad_theta_j, = torch.autograd.grad(log_j, theta_tmp,
+                                            retain_graph=False,
+                                            create_graph=False)
+        log_lik_list.append(log_j.detach())      # scalar
+        grad_list.append(grad_theta_j.detach())  # (d,d)
+
+    log_lik   = torch.stack(log_lik_list)        # (K,)
+    grads_raw = torch.stack(grad_list)           # (K,d,d)
+
+    # ---------- sign-stable weighted average ------------------------------
+    flat_dim  = grads_raw[0].numel()             # d*d
+    grads_f   = grads_raw.view(K, flat_dim).T    # (flat_dim, K)
+    log_b     = log_lik.unsqueeze(0)             # (1,K) broadcast
+
+    log_num, sign = logsumexp_with_sign(log_b, grads_f, dim=1)  # per coord
+    log_den       = torch.logsumexp(log_lik, dim=0)             # scalar
+
+    grad_theta_flat = sign * torch.exp(log_num - log_den)       # N / D
+    grad_theta      = grad_theta_flat.view_as(theta)            # (d,d)
+
+    return grad_theta
+
+
 
 def grad_log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparams: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -414,11 +542,12 @@ def grad_log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparam
     #grad_z = grad_z_score(params["z"], data, params["theta"].detach(), hparams)
     #grad_z = grad_z_score_softmax(params["z"], data, params["theta"].detach(), hparams)
 
-    #grad_z = grad_z_score_autograd(params["z"], data, params["theta"].detach(), hparams)
-    grad_z = grad_z_score_autograd_softmax(params["z"], data, params["theta"].detach(), hparams)
+    grad_z = grad_z_score_stable_sign(params["z"], data, params["theta"].detach(), hparams)
+    #grad_z = grad_z_score_autograd_softmax(params["z"], data, params["theta"].detach(), hparams)
     #grad_z = grad_z_score_autograd_stable(params["z"], data, params["theta"].detach(), hparams)
 
-    grad_th = grad_theta_score(params["z"].detach(), data, params["theta"], hparams)
+    #grad_th = grad_theta_score(params["z"].detach(), data, params["theta"], hparams)
+    grad_th = grad_theta_score_stable_sign(params["z"].detach(), data, params["theta"], hparams)
     return grad_z, grad_th
 
 def log_joint(params: Dict[str, Any], data: Dict[str, Any], hparams: Dict[str, Any]) -> torch.Tensor:
@@ -459,7 +588,7 @@ def update_dibs_hparams(hparams: Dict[str, Any], t: int) -> Dict[str, Any]:
     Handles annealing schedules for hyperparameters.
     """
     # Simple linear annealing
-    hparams['alpha'] = hparams['alpha_base'] * t 
+    hparams['alpha'] = hparams['alpha_base'] * t *0.2 
     hparams['beta'] = hparams['beta_base'] * t
     hparams['current_t'] = t
     return hparams
@@ -634,23 +763,23 @@ class Config:
     chain_length = d_nodes
     
     # Parameters for 'erdos_renyi'
-    p_edge = 0.7  # Probability of edge existence
+    p_edge = 0.6  # Probability of edge existence
     
     # Parameters for 'scale_free'
     m_edges = 2  # Number of edges to attach from each new node
 
     # --- Model ---
     k_latent = d_nodes
-    alpha_base = 0.02  # Base value for annealing
+    alpha_base = 0.2  # Base value for annealing
     beta_base = 1.0   # Base value for annealing
     theta_prior_sigma = 1.0
     
     # --- MC Sampling ---
-    n_mc_samples = 64
+    n_mc_samples = 128
 
     # --- Training ---
     lr = 5e-3
-    num_iterations = 2000
+    num_iterations = 1500
     debug_print_iter = 100
 
 cfg = Config()
