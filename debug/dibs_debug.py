@@ -263,6 +263,80 @@ def logsumexp_with_sign(a: torch.Tensor,
 # -------------------------------------------------------------
 
 
+
+def stable_ratio2(grad_samples, log_density_samples):
+    eps = 1e-30
+    
+    log_p = torch.stack(log_density_samples)
+    grads = torch.stack(grad_samples)
+
+    log_grads_abs = torch.log(grads.abs() + eps)
+
+    pos_mask = grads >= 0
+    neg_mask = grads < 0
+
+    n_pos = pos_mask.sum().clamp(min=1)
+    n_neg = neg_mask.sum().clamp(min=1)
+
+    print(f'n_pos: {n_pos}, n_neg: {n_neg}')
+
+    print(f'log_grads_abs: {log_grads_abs}')
+
+    log_grads_abs_pos = log_grads_abs.masked_fill(~pos_mask, float('-inf'))
+    print(f'log_grads_abs_pos: {log_grads_abs_pos}')
+    log_grads_abs_neg = log_grads_abs.masked_fill(~neg_mask, float('-inf'))
+    print(f'log_grads_abs_neg: {log_grads_abs_neg}')
+
+    log_numerator_positive = torch.logsumexp(log_grads_abs_pos, dim=0) - torch.log(n_pos.float())
+    print(f'log_numerator_positive: {log_numerator_positive}')
+    log_numerator_negative = torch.logsumexp(log_grads_abs_neg, dim=0) - torch.log(n_neg.float())
+    print(f'log_numerator_negative: {log_numerator_negative}')
+    log_den = torch.logsumexp(log_p, dim=0) - torch.log(torch.tensor(len(log_p), dtype=log_p.dtype, device=log_p.device))
+    print(f'log_den: {log_den}')
+
+
+
+
+
+    final_grad = torch.exp(log_numerator_positive - log_den) - torch.exp(log_numerator_negative - log_den)
+    print(f'final_grad: {final_grad}')
+
+
+    return final_grad
+
+def stable_ratio(grad_samples, log_density_samples, eps=1e-40):
+    """
+    E[grad]  ≈  Σ_s grad_s * softmax(log_p_s)
+    implemented in log-space with sign-tracking so it works
+    even when some grad components are negative.
+    """
+    # Stack to shape [S, …] where S = #samples
+    log_p   = torch.stack(log_density_samples)          # [S]
+    grads   = torch.stack(grad_samples)                 # [S, d, d]
+
+    S = log_p.shape[0]
+    flat_dim = grads[0].numel()
+
+    # ---------- prepare tensors ----------
+    log_p_b   = log_p.view(S, 1).expand(S, flat_dim)    # [S, F]
+    grads_f   = grads.view(S, flat_dim)                 # [S, F]
+
+    # ---------- log-sum-exp with sign ----------
+    a_max     = torch.max(log_p_b, dim=0, keepdim=True)[0]  # [1, F]
+    scaled    = grads_f * torch.exp(log_p_b - a_max)        # weight * e^(shifted log_p)
+    s         = scaled.sum(dim=0)                           # [F]
+    sign      = torch.sign(s).detach()
+    log_num   = torch.log(torch.abs(s) + eps) + a_max.squeeze(0)  # [F]
+
+    # denominator  log Z
+    log_den   = torch.logsumexp(log_p, dim=0)   # scalar
+
+    # ---------- assemble ----------
+    grad = sign * torch.exp(log_num - log_den)  # [F]
+    return grad.view_as(grads[0])
+
+
+
 def grad_z_score_stable_sign(z: torch.Tensor,
                              data: Dict[str, Any],
                              theta: torch.Tensor,
@@ -302,31 +376,33 @@ def grad_z_score_stable_sign(z: torch.Tensor,
         tot_acycl += h * score        # accumulate β∇h
 
     # ------------ stack tensors ------------------------------
-    log_lik   = torch.stack(log_lik)            # [K]
-    score_raw = torch.stack(score_raw)          # [K, *z.shape]
+    log_lik_tensor   = torch.stack(log_lik)            # [K]
+    score_raw_tensor = torch.stack(score_raw)          # [K, *z.shape]
 
     # acyclicity term (simple average)
     grad_acycl = tot_acycl / K
 
     # ------------ stable numerator / denominator -------------
-    flat_dim   = score_raw[0].numel()           # d*k*2
-    scores_f   = score_raw.view(K, flat_dim).T  # [flat_dim, K]
-    log_lik_b  = log_lik.unsqueeze(0)           # broadcast: [1,K] → [flat_dim,K]
+    flat_dim   = score_raw_tensor[0].numel()           # d*k*2
+    scores_f   = score_raw_tensor.view(K, flat_dim).T  # [flat_dim, K]
+    log_lik_b  = log_lik_tensor.unsqueeze(0)           # broadcast: [1,K] → [flat_dim,K]
 
     log_num, sign = logsumexp_with_sign(log_lik_b, scores_f, dim=1)  # per coord
-    log_den       = torch.logsumexp(log_lik, dim=0)                  # scalar
+    log_den       = torch.logsumexp(log_lik_tensor, dim=0)                  # scalar
 
     # N/D   (K cancels, but keep it to mirror JAX algebra)
     grad_lik_flat = sign * torch.exp(log_num - math.log(K) -
                                      log_den + math.log(K))
 
-    grad_lik = grad_lik_flat.view_as(score_raw[0])        # [d,k,2]
+    grad_lik = grad_lik_flat.view_as(score_raw_tensor[0])        # [d,k,2]
 
     # ------------ final combined gradient --------------------
     beta      = hparams['beta']
-    total_grad = grad_z_prior + grad_lik - beta * grad_acycl
+    #total_grad = grad_z_prior + grad_lik - beta * grad_acycl
 
-    return total_grad
+    final_grad = grad_z_prior - beta*grad_acycl + stable_ratio(score_raw, log_lik)
+
+    return final_grad
 
 
 def analytic_score_g_given_z(z, g, hparams):
@@ -484,54 +560,43 @@ def grad_theta_score_stable_sign(z:      torch.Tensor,
                                  data:   Dict[str, Any],
                                  theta:  torch.Tensor,
                                  hparams: Dict[str, Any]) -> torch.Tensor:
-    """
-    Sign-stable score-function estimator for ∇_Θ log p(z,Θ | D).
+     
+    n_samples = hparams.get('n_mc_samples', 64)
+    
+    log_density_samples = []
+    grad_samples = []
 
-    * Draw K graphs   G₁…G_K  ~  p(G | z)        (hard Bernoulli here)
-    * For each graph compute
-        ℓ_j  = log p(D,Θ | G_j)                  (log-likelihood term)
-        b_j  = ∇_Θ ℓ_j                           (gradient wrt Θ)
-    * Return   E_{p(G|z,D)} [ b_j ]
-              = Σ b_j · e^{ℓ_j}  /  Σ e^{ℓ_j},
-      with all numerator components evaluated stably in log-space.
-    """
-    K = hparams.get('n_mc_samples', 64)
-    d = theta.size(0)
-
-    log_lik_list, grad_list = [], []
-
-    for _ in range(K):
-        # ---- 1. sample hard graph ----------------------------------------
+    for _ in range(n_samples):
+        theta_for_grad = theta.clone().requires_grad_(True)
+        
+        # 1. Sample a hard graph G
         with torch.no_grad():
-            G = torch.bernoulli(soft_gmat(z, hparams))
+            g_hard = torch.bernoulli(soft_gmat(z, hparams))
 
-        # ---- 2. log-density  ℓ_j  ----------------------------------------
-        theta_tmp = theta.clone().requires_grad_(True)
-        log_j = (log_full_likelihood(data, G, theta_tmp, hparams) +
-                 log_theta_prior(theta_tmp * G,
-                                 hparams['theta_prior_sigma']))
-        # ---- 3. gradient wrt Θ   b_j  ------------------------------------
-        grad_theta_j, = torch.autograd.grad(log_j, theta_tmp,
-                                            retain_graph=False,
-                                            create_graph=False)
-        log_lik_list.append(log_j.detach())      # scalar
-        grad_list.append(grad_theta_j.detach())  # (d,d)
+        # 2. Calculate the log-density `log p(D,Θ|G)` for this sample.
+        # This will be used to create the softmax weights.
+        log_density = (
+            log_full_likelihood(data, g_hard, theta_for_grad, hparams) + 
+            log_theta_prior(theta_for_grad * g_hard, hparams.get('theta_prior_sigma', 1.0))
+        )
+        
+        # 3. Calculate the gradient of this log-density, ∇_Θ log p(D,Θ|G).
+        grad, = torch.autograd.grad(log_density, theta_for_grad)
 
-    log_lik   = torch.stack(log_lik_list)        # (K,)
-    grads_raw = torch.stack(grad_list)           # (K,d,d)
+        # Store the results for this sample
+        log_density_samples.append(log_density)
+        grad_samples.append(grad)
 
-    # ---------- sign-stable weighted average ------------------------------
-    flat_dim  = grads_raw[0].numel()             # d*d
-    grads_f   = grads_raw.view(K, flat_dim).T    # (flat_dim, K)
-    log_b     = log_lik.unsqueeze(0)             # (1,K) broadcast
+    # 4. Compute the final gradient as a weighted average.
+    log_p = torch.stack(log_density_samples)
+    grad_p = torch.stack(grad_samples)
 
-    log_num, sign = logsumexp_with_sign(log_b, grads_f, dim=1)  # per coord
-    log_den       = torch.logsumexp(log_lik, dim=0)             # scalar
+    final_grad = stable_ratio(grad_samples, log_density_samples)
+    
 
-    grad_theta_flat = sign * torch.exp(log_num - log_den)       # N / D
-    grad_theta      = grad_theta_flat.view_as(theta)            # (d,d)
 
-    return grad_theta
+    return final_grad  
+
 
 
 
