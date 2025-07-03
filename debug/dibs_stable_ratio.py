@@ -68,8 +68,38 @@ def log_full_likelihood(data: Dict[str, Any], g_soft: torch.Tensor, theta: torch
 def log_theta_prior(theta_effective: torch.Tensor, sigma: float) -> torch.Tensor:
     return log_gaussian_likelihood(theta_effective, torch.zeros_like(theta_effective), sigma=sigma)
 
-
+import math
 def stable_ratio(grad_samples, log_density_samples):
+    eps = 1e-30
+    S   = len(log_density_samples)                    # == M
+
+    log_p   = torch.stack(log_density_samples)        # [S]
+    grads   = torch.stack(grad_samples)               # [S,*]
+
+    while log_p.dim() < grads.dim():
+        log_p = log_p.unsqueeze(-1)
+
+    log_den = torch.logsumexp(log_p, dim=0) - math.log(S)
+
+    pos = grads >= 0
+    neg = ~pos
+
+    log_num_pos = torch.logsumexp(
+        torch.where(pos,
+                    torch.log(grads.abs() + eps) + log_p,
+                    torch.full_like(log_p, -float('inf'))),
+        dim=0) - math.log(S)
+
+    log_num_neg = torch.logsumexp(
+        torch.where(neg,
+                    torch.log(grads.abs() + eps) + log_p,
+                    torch.full_like(log_p, -float('inf'))),
+        dim=0) - math.log(S)
+
+    return torch.exp(log_num_pos - log_den) - torch.exp(log_num_neg - log_den)
+
+
+def stable_ratio_old(grad_samples, log_density_samples):
     eps = 1e-30
     
     log_p = torch.stack(log_density_samples)
@@ -309,7 +339,7 @@ def grad_log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparam
     grad_theta = grad_theta_score_stable_ratio(params["z"].detach(), data, params["theta"], hparams)
 
     # printing z and theta every 10 iterations or x > 3000
-    if hparams['current_t'] % 9999 == 0:
+    if hparams['current_t'] % 1500 == 0:
         print('--------------------------------')
         print(f"z: {params['z']}")
         print(f"gradient of z: {grad_z}")
@@ -362,7 +392,7 @@ def update_dibs_hparams_base(hparams: Dict[str, Any], t: int) -> Dict[str, Any]:
     hparams['current_t'] = t
     return hparams
 
-def update_dibs_hparams(hparams: Dict[str, Any], t: int) -> Dict[str, Any]:
+def update_dibs_hparams_chain_works(hparams: Dict[str, Any], t: int) -> Dict[str, Any]:
     """
     Handles annealing schedules for hyperparameters with a more balanced approach.
     """
@@ -386,6 +416,27 @@ def update_dibs_hparams(hparams: Dict[str, Any], t: int) -> Dict[str, Any]:
         adjusted_progress = (progress - burn_in_fraction) / (1 - burn_in_fraction)
         hparams['beta'] = b_final * adjusted_progress
     
+    hparams['current_t'] = t
+    return hparams
+
+def update_dibs_hparams(hparams: Dict[str, Any], t: int) -> Dict[str, Any]:
+
+    alpha_max = 50.
+    beta_max  = 500.
+
+    progress = t / hparams['total_steps']
+
+    # warm-up α quickly (half-life 0.1) and then keep it fixed
+    hparams['alpha'] = alpha_max * (1 - math.exp(-5 * progress))
+
+    # β: cubic ramp after warm-up
+    warm = 0.1
+    if progress < warm:
+        hparams['beta'] = 0.
+    else:
+        x = (progress - warm) / (1 - warm)          # 0 → 1
+        hparams['beta'] = beta_max * x**3
+
     hparams['current_t'] = t
     return hparams
 
@@ -549,11 +600,11 @@ class Config:
     
     # --- Data Generation ---
     # Choose data source: 'simple_chain', 'erdos_renyi', 'scale_free'
-    data_source = 'simple_chain'
+    data_source = 'scale_free'
     
     # --- Data Parameters ---
     d_nodes = 4
-    num_samples = 100
+    num_samples = 1000
     obs_noise_std = 0.1
     
     # Parameters for 'simple_chain'
@@ -572,7 +623,7 @@ class Config:
     theta_prior_sigma = 1.0
     
     # --- MC Sampling ---
-    n_mc_samples = 64
+    n_mc_samples = 256
 
     # --- Training ---
     lr = 5e-3
@@ -719,6 +770,11 @@ def main():
 
 
             with torch.no_grad():
+
+                soft = soft_gmat(particle['z'], hparams)
+                log.info(f"edge prob min/max: {soft.min().item()}, {soft.max().item()}")
+                log.info(f"acyclicity soft  : {acyclic_constr(soft, cfg.d_nodes).item()}")
+
                 lj_val = log_joint(particle, data, hparams).item()
                 grad_z_norm = torch.linalg.norm(grad_z).item()
                 grad_theta_norm = torch.linalg.norm(grad_th).item()
