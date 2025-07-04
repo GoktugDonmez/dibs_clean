@@ -6,7 +6,7 @@ from typing import Dict, Any, Tuple
 import torch.nn as nn
 import igraph as ig  
 
-DEBUG_PRINT_ITER = 100
+DEBUG_PRINT_ITER = 10
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger()
@@ -139,10 +139,12 @@ def score_func_estimator_stable(data, z, hparams, f, normalized=True):
         + torch.log(torch.clamp(torch.abs(scores), min=1e-30)) * torch.sign(scores),
         dim=0,
     )
+    log_numerator -= torch.log(torch.tensor(len(log_f), dtype=log_f.dtype, device=log_f.device))
 
     # If the score function estimator has a denominator
     if normalized:
         log_denominator = torch.logsumexp(log_f, dim=0)
+        log_denominator -= torch.log(torch.tensor(len(log_f), dtype=log_f.dtype, device=log_f.device))
         result = torch.exp(log_numerator - log_denominator)
     else:
         result = torch.exp(log_numerator)
@@ -177,6 +179,11 @@ def grad_z_score_stable(z: torch.Tensor, data: Dict[str, Any], theta: torch.Tens
         normalized=False
     )
 
+    if hparams['current_t'] % DEBUG_PRINT_ITER == 0:
+        print(f"grad_likelihood: {grad_likelihood}")
+        print(f"grad_acyclic: {grad_acyclic}")
+        print(f"grad_z_prior: {grad_z_prior}")
+        print(f"acyclic  penalty: {-hparams['beta'] * grad_acyclic}")
 
     total_grad = grad_z_prior + grad_likelihood - hparams['beta'] * grad_acyclic
 
@@ -493,7 +500,7 @@ class Config:
 
     # --- Training ---  
     lr = 5e-3
-    num_iterations = 1500
+    num_iterations = 150
     debug_print_iter = DEBUG_PRINT_ITER
 
 cfg = Config()

@@ -291,6 +291,15 @@ def grad_z_score_stable_ratio(z: torch.Tensor,
 
     # ---- combine ------------------------------------------------------------
     total_grad = grad_prior + grad_lik - beta * grad_acyc
+
+    if hparams['current_t'] % DEBUG_PRINT_ITER == 0:
+        print(f"grad_prior: {grad_prior}")
+        print(f"grad_lik: {grad_lik}")
+        print(f"grad_acyc: {grad_acyc}")
+        print(f"acyclic  penalty: {-hparams['beta'] * grad_acyc}")
+        print(f"total_grad: {total_grad}")
+
+
     return total_grad
 
 
@@ -791,5 +800,114 @@ def main():
         log.info(f"Learned Effective Weights (G_learned * Theta_learned):\n{effective_learned_weights}")
 
 
+
+def score_func_estimator_stable(data, z, hparams, f, normalized=True):
+    # f is a function G, as in Equation B.8
+    _n_mc = hparams["n_mc_samples"]
+    _soft_gmat = soft_gmat(z, hparams)
+    distr = torch.distributions.Bernoulli(_soft_gmat)
+    hard_gmats = distr.sample((_n_mc,))
+
+    # log joint densities as many Gs
+    log_f = torch.func.vmap(
+        f,
+        randomness="different",
+    )(hard_gmats)
+
+    # grad_Z log p(G|Z) at one G
+    score_func = lambda g: torch.autograd.grad(
+        torch.distributions.Bernoulli(soft_gmat(z, hparams))
+        .log_prob(g)
+        .sum(),
+        z,
+        create_graph=True,
+    )[0]
+
+    scores = torch.stack([score_func(g) for g in hard_gmats])
+
+    while log_f.dim() < scores.dim():
+        log_f = log_f.unsqueeze(-1)
+
+    log_numerator = torch.logsumexp(
+        log_f
+        + torch.log(torch.clamp(torch.abs(scores), min=1e-30)) * torch.sign(scores),
+        dim=0,
+    )
+
+    # If the score function estimator has a denominator
+    if normalized:
+        log_denominator = torch.logsumexp(log_f, dim=0)
+        result = torch.exp(log_numerator - log_denominator)
+    else:
+        result = torch.exp(log_numerator)
+
+    return result
+
+
+def grad_z_score_stable_mix(z: torch.Tensor, data: Dict[str, Any], theta: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
+    
+    grad_z_prior = - (z /hparams['sigma_z'] **2)
+
+    def f_likelihood(g):
+        return (log_full_likelihood(data, g, theta, hparams) + log_theta_prior(theta * g, hparams['theta_prior_sigma']))
+
+    grad_likelihood = score_func_estimator_stable(
+        data=data,
+        z=z,
+        hparams=hparams,
+        f=f_likelihood,
+        normalized=True
+    )
+
+    #def f_acyclic(g):
+    #    d = z.shape[0]
+    #    return acyclic_constr(g, d)
+    
+    #grad_acyclic = score_func_estimator_stable(
+    #    data=data,
+    #    z=z,
+    #    hparams=hparams,
+    #    f=f_acyclic,
+    #    normalized=False
+    #)
+    acyc_score_total = 0
+    for _ in range(hparams['n_mc_samples']):
+        # 1. Sample hard graph G ~ Bernoulli(edge_probs)
+        G = torch.bernoulli(soft_gmat(z, hparams))
+
+        # 2. Score term  b_s = ∇_z log q(G|z)
+        score = torch.autograd.grad(
+            torch.distributions.Bernoulli(soft_gmat(z, hparams))
+            .log_prob(G)
+            .sum(),
+            z,
+            create_graph=True,
+        )[0]
+
+        # 3. Log-joint   ℓ_s = log p(D,Θ | G)
+        h_val = acyclic_constr(G, z.shape[0])            # acyclicity penalty
+
+        # Accumulate
+        acyc_score_total += h_val * score
+
+    # ---- likelihood gradient via stable ratio ------------------------------
+
+    # ---- acyclicity gradient ------------------------------------------------
+    grad_acyclic = acyc_score_total / hparams['n_mc_samples']
+
+    
+
+    if hparams['current_t'] % DEBUG_PRINT_ITER == 0:
+        print(f"grad_likelihood: {grad_likelihood}")
+        print(f"grad_acyclic: {grad_acyclic}")
+        print(f"grad_z_prior: {grad_z_prior}")
+        print(f"acyclic  penalty: {-hparams['beta'] * grad_acyclic}")
+
+    total_grad = grad_z_prior + grad_likelihood - hparams['beta'] * grad_acyclic
+
+    return total_grad
+
+
 if __name__ == '__main__':
     main()
+
