@@ -68,7 +68,7 @@ def log_full_likelihood(data: Dict[str, Any], g_soft: torch.Tensor, theta: torch
 def log_theta_prior(theta_effective: torch.Tensor, sigma: float) -> torch.Tensor:
     return log_gaussian_likelihood(theta_effective, torch.zeros_like(theta_effective), sigma=sigma)
 
-import math
+
 def stable_ratio(grad_samples, log_density_samples):
     eps = 1e-30
     S   = len(log_density_samples)                    # == M
@@ -79,7 +79,7 @@ def stable_ratio(grad_samples, log_density_samples):
     while log_p.dim() < grads.dim():
         log_p = log_p.unsqueeze(-1)
 
-    log_den = torch.logsumexp(log_p, dim=0) - math.log(S)
+    log_den = torch.logsumexp(log_p, dim=0) - torch.log(torch.tensor(len(log_p), dtype=log_p.dtype, device=log_p.device))
 
     pos = grads >= 0
     neg = ~pos
@@ -88,13 +88,13 @@ def stable_ratio(grad_samples, log_density_samples):
         torch.where(pos,
                     torch.log(grads.abs() + eps) + log_p,
                     torch.full_like(log_p, -float('inf'))),
-        dim=0) - math.log(S)
+        dim=0) - torch.log(torch.tensor(len(log_p), dtype=log_p.dtype, device=log_p.device))
 
     log_num_neg = torch.logsumexp(
         torch.where(neg,
                     torch.log(grads.abs() + eps) + log_p,
                     torch.full_like(log_p, -float('inf'))),
-        dim=0) - math.log(S)
+        dim=0) - torch.log(torch.tensor(len(log_p), dtype=log_p.dtype, device=log_p.device))
 
     return torch.exp(log_num_pos - log_den) - torch.exp(log_num_neg - log_den)
 
@@ -339,7 +339,7 @@ def grad_log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparam
     grad_theta = grad_theta_score_stable_ratio(params["z"].detach(), data, params["theta"], hparams)
 
     # printing z and theta every 10 iterations or x > 3000
-    if hparams['current_t'] % 1500 == 0:
+    if hparams['current_t'] % DEBUG_PRINT_ITER == 0:
         print('--------------------------------')
         print(f"z: {params['z']}")
         print(f"gradient of z: {grad_z}")
@@ -381,18 +381,18 @@ def log_joint(params: Dict[str, Any], data: Dict[str, Any], hparams: Dict[str, A
                  f"Acyclicity: {acyclicity_val.item():.4f}")
     return log_joint
 
-def update_dibs_hparams_base(hparams: Dict[str, Any], t: int) -> Dict[str, Any]:
+def update_dibs_hparams(hparams: Dict[str, Any], t: int) -> Dict[str, Any]:
     """
     Handles annealing schedules for hyperparameters.
     """
     # Simple linear annealing
 
-    hparams['alpha'] = hparams['alpha_base'] * t
-    hparams['beta'] = hparams['beta_base'] * t
+    hparams['alpha'] = hparams['alpha_base'] * t*0.2
+    hparams['beta'] = hparams['beta_base'] * t * 0.1
     hparams['current_t'] = t
     return hparams
 
-def update_dibs_hparams_chain_works(hparams: Dict[str, Any], t: int) -> Dict[str, Any]:
+def update_dibs_hparams_V2(hparams: Dict[str, Any], t: int) -> Dict[str, Any]:
     """
     Handles annealing schedules for hyperparameters with a more balanced approach.
     """
@@ -416,27 +416,6 @@ def update_dibs_hparams_chain_works(hparams: Dict[str, Any], t: int) -> Dict[str
         adjusted_progress = (progress - burn_in_fraction) / (1 - burn_in_fraction)
         hparams['beta'] = b_final * adjusted_progress
     
-    hparams['current_t'] = t
-    return hparams
-
-def update_dibs_hparams(hparams: Dict[str, Any], t: int) -> Dict[str, Any]:
-
-    alpha_max = 50.
-    beta_max  = 500.
-
-    progress = t / hparams['total_steps']
-
-    # warm-up α quickly (half-life 0.1) and then keep it fixed
-    hparams['alpha'] = alpha_max * (1 - math.exp(-5 * progress))
-
-    # β: cubic ramp after warm-up
-    warm = 0.1
-    if progress < warm:
-        hparams['beta'] = 0.
-    else:
-        x = (progress - warm) / (1 - warm)          # 0 → 1
-        hparams['beta'] = beta_max * x**3
-
     hparams['current_t'] = t
     return hparams
 
@@ -600,11 +579,11 @@ class Config:
     
     # --- Data Generation ---
     # Choose data source: 'simple_chain', 'erdos_renyi', 'scale_free'
-    data_source = 'scale_free'
+    data_source = 'simple_chain'
     
     # --- Data Parameters ---
-    d_nodes = 4
-    num_samples = 1000
+    d_nodes = 3
+    num_samples = 100
     obs_noise_std = 0.1
     
     # Parameters for 'simple_chain'
@@ -623,11 +602,11 @@ class Config:
     theta_prior_sigma = 1.0
     
     # --- MC Sampling ---
-    n_mc_samples = 256
+    n_mc_samples = 128
 
     # --- Training ---
     lr = 5e-3
-    num_iterations = 3000
+    num_iterations = 1500
     debug_print_iter = DEBUG_PRINT_ITER
 
 cfg = Config()
