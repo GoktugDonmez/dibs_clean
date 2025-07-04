@@ -311,16 +311,5 @@ if __name__ == "__main__":
             current_params = {**params, "hard_gmat": hard_gmat(params["z"])}
             lj = log_joint(data, current_params, hparams).detach().cpu().item()
             print(f"           log_joint={lj:.2f}")
+            print(f"soft_gmat={soft_gmat(params['z'], hparams)}")
 
-    # ---------------------  visualisation ------------------------------------
-    learnt_soft_gmat = soft_gmat(params["z"], {"alpha": 1.0}).detach().cpu().numpy()
-    learnt_hard_gmat = (learnt_soft_gmat > 0.5).astype(np.float32)
-    learnt_theta = params["theta"].detach().cpu().numpy()
-
-    for i, matrix in enumerate([gt_gmat.cpu().numpy() * gt_theta.cpu().numpy(), learnt_hard_gmat * learnt_theta], 1):
-        plt.subplot(1, 2, i)
-        plt.imshow(matrix, cmap="viridis")
-        for (x_, y_), val in np.ndenumerate(matrix):
-            plt.text(y_, x_, f"{val:.2f}", ha="center", va="center", color="white")
-
-    plt.show()
