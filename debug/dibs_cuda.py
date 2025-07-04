@@ -1,304 +1,326 @@
-import torch
-from torch.distributions import Bernoulli
+import matplotlib.pyplot as plt
 import numpy as np
-import logging
-from typing import Dict, Any, Tuple
-import torch.nn as nn
-import igraph as ig
+import torch
 
-# -----------------------------------------------------------------------------
-# Logging setup
-# -----------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-log = logging.getLogger()
+# --------------------------------------------------
+#  Device selection
+# --------------------------------------------------
+# Runs on the first CUDA‑capable GPU if available, otherwise CPU.
+# Everything created below inherits the device from existing tensors or uses
+# the global ``device`` helper.
 
-# -----------------------------------------------------------------------------
-# Core helpers (mostly identical to original, but with device-aware tensor
-# creation)
-# -----------------------------------------------------------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def acyclic_constr(g: torch.Tensor, d: int) -> torch.Tensor:
-    """ NOTE: supports batched `g` of shape (S,d,d) or single (d,d). """
-    alpha = 1.0 / d
-    eye = torch.eye(d, device=g.device, dtype=g.dtype)
-    m = eye + alpha * g
-    return torch.trace(torch.linalg.matrix_power(m, d)) - d if g.dim() == 2 else (
-        # vmap over first dim when batched
-        torch.func.vmap(lambda A: torch.trace(torch.linalg.matrix_power(eye + alpha * A, d)) - d)(g)
+
+# --------------------------------------------------
+#  Helper functions
+# --------------------------------------------------
+
+def loglik_gaussian(x, pred_mean, sigma):
+    """Log‑likelihood of a spherical Gaussian."""
+    assert sigma.shape[0] == pred_mean.shape[-1]
+    distr = torch.distributions.Normal(pred_mean, sigma)
+    return torch.sum(distr.log_prob(x))
+
+
+def loglik_bernoulli(y, pred_p, rho):
+    """Smoothed Bernoulli log‑likelihood used for expert feedback."""
+    jitter = 1e-5
+    p_tilde = rho + pred_p - 2.0 * rho * pred_p
+    return torch.sum(
+        y * torch.log(1.0 - p_tilde + jitter) + (1.0 - y) * torch.log(p_tilde + jitter)
     )
 
-def log_gaussian_likelihood(x: torch.Tensor, pred_mean: torch.Tensor, sigma: float = 0.1) -> torch.Tensor:
-    sigma_tensor = torch.tensor(sigma, dtype=pred_mean.dtype, device=pred_mean.device)
-    residuals = x - pred_mean
-    log_prob = -0.5 * (torch.log(2 * torch.pi * sigma_tensor**2)) - 0.5 * ((residuals / sigma_tensor) ** 2)
-    return torch.sum(log_prob)
 
-def scores(z: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
-    u, v = z[..., 0], z[..., 1]
-    raw_scores = hparams["alpha"] * torch.einsum("...ik,...jk->...ij", u, v)
-    _, d = z.shape[:-1]
-    diag_mask = 1.0 - torch.eye(d, device=z.device, dtype=z.dtype)
-    return raw_scores * diag_mask
+# ---- Graph samplers --------------------------------------------------------
 
-def soft_gmat(z: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
-    raw_scores = scores(z, hparams)
-    edge_probs = torch.sigmoid(raw_scores)
+def soft_gmat_gumbel(z, hparams):
+    """Soft adjacency matrix via Gumbel‑sigmoid reparametrisation."""
     d = z.shape[0]
-    diag_mask = 1.0 - torch.eye(d, device=z.device, dtype=z.dtype)
-    return edge_probs * diag_mask
+    cycle_mask = 1.0 - torch.eye(d, device=z.device)
 
-def log_full_likelihood(data: Dict[str, Any], g_soft: torch.Tensor, theta: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
-    x_data = data["x"]
-    effective_W = theta * g_soft
-    pred_mean = torch.matmul(x_data, effective_W)
-    sigma_obs = hparams.get("sigma_obs_noise", 0.1)
-    return log_gaussian_likelihood(x_data, pred_mean, sigma=sigma_obs)
+    u = torch.rand((d, d), device=z.device)
+    ls = torch.log(u) - torch.log(1.0 - u)
+    inner_product_scores = torch.einsum("ik, jk -> ij", z[:, :, 0], z[:, :, 1])
+    sampled_scores = ls + (hparams["alpha"] * inner_product_scores)
+    soft_gmat_unmasked = torch.sigmoid(hparams["tau"] * sampled_scores)
+    return cycle_mask * soft_gmat_unmasked
 
-def log_theta_prior(theta_effective: torch.Tensor, sigma: float) -> torch.Tensor:
-    return log_gaussian_likelihood(theta_effective, torch.zeros_like(theta_effective), sigma=sigma)
 
-# -----------------------------------------------------------------------------
-# Numerical stable ratio helper (unchanged)
-# -----------------------------------------------------------------------------
+def hard_gmat(z):
+    """Deterministic hard thresholding at 0.0 (sign of the inner product)."""
+    d = z.shape[0]
+    cycle_mask = 1.0 - torch.eye(d, device=z.device)
+    inner_product_scores = torch.einsum("ik, jk -> ij", z[:, :, 0], z[:, :, 1])
+    return cycle_mask * (inner_product_scores > 0.0)
 
-def stable_ratio(grad_samples, log_density_samples):
-    eps = 1e-30
-    log_p = torch.stack(log_density_samples)
-    grads = torch.stack(grad_samples)
-    while log_p.dim() < grads.dim():
-        log_p = log_p.unsqueeze(-1)
-    log_grads_abs = torch.log(grads.abs() + eps) + log_p
-    pos_mask = grads >= 0
-    neg_mask = grads < 0
-    n_pos = pos_mask.sum().clamp(min=1)
-    n_neg = neg_mask.sum().clamp(min=1)
-    log_grads_abs_pos = log_grads_abs.masked_fill(~pos_mask, float("-inf"))
-    log_grads_abs_neg = log_grads_abs.masked_fill(~neg_mask, float("-inf"))
-    log_num_pos = torch.logsumexp(log_grads_abs_pos, dim=0) - torch.log(n_pos.float())
-    log_num_neg = torch.logsumexp(log_grads_abs_neg, dim=0) - torch.log(n_neg.float())
-    log_den = torch.logsumexp(log_p, dim=0) - torch.log(torch.tensor(len(log_p), dtype=log_p.dtype, device=log_p.device))
-    return torch.exp(log_num_pos - log_den) - torch.exp(log_num_neg - log_den)
 
-# -----------------------------------------------------------------------------
-# Vectorised / GPU-friendly Monte-Carlo estimators
-# -----------------------------------------------------------------------------
+def soft_gmat(z, hparams):
+    """Deterministic soft adjacency without stochasticity."""
+    d = z.shape[0]
+    cycle_mask = 1.0 - torch.eye(d, device=z.device)
+    inner_product_scores = torch.einsum("ik, jk -> ij", z[:, :, 0], z[:, :, 1])
+    soft_gmat_unmasked = torch.sigmoid(hparams["alpha"] * inner_product_scores)
+    return cycle_mask * soft_gmat_unmasked
 
-def score_func_estimator_stable(data, z, hparams, f, normalized=True):
-    """Vectorised version without Python for-loops."""
-    S = hparams["n_mc_samples"]
-    g_probs = soft_gmat(z, hparams)
-    hard_gmats = Bernoulli(g_probs).sample((S,))  # (S,d,d) on same device
 
-    # 1)   log_f(G)
-    log_f = torch.func.vmap(f, randomness="different")(hard_gmats)  # (S,)
+# ---- Acyclicity constraint --------------------------------------------------
 
-    # 2)   score function ∇_z log p(G|Z)
-    def _score_single(g):
-        return torch.autograd.grad(Bernoulli(soft_gmat(z, hparams)).log_prob(g).sum(), z, create_graph=True)[0]
+def acyclic_constr_mc_gumbel(z, hparams):
+    """Monte‑Carlo estimate of the NOTEARS acyclicity constraint."""
+    soft_gmats_gumbel = torch.func.vmap(
+        lambda _: soft_gmat_gumbel(z, hparams), randomness="different"
+    )(torch.arange(hparams["n_gumbel_mc_samples"], device=z.device))
 
-    scores = torch.func.vmap(_score_single)(hard_gmats)  # (S, *z.shape)
+    hard_gmats = torch.distributions.Bernoulli(soft_gmats_gumbel).sample()
+    return torch.mean(torch.func.vmap(acyclic_constr)(hard_gmats))
 
-    while log_f.dim() < scores.dim():
-        log_f = log_f.unsqueeze(-1)
 
-    log_num = torch.logsumexp(log_f + torch.log(torch.clamp(torch.abs(scores), min=1e-30)) * torch.sign(scores), dim=0)
+def acyclic_constr(g_mat):
+    d = g_mat.shape[0]
+    alpha = 1.0 / d
+    M = torch.eye(d, device=g_mat.device) + alpha * g_mat
+    M_mult = torch.linalg.matrix_power(M, d)
+    h = torch.trace(M_mult) - d
+    return h
+
+
+# ---- Misc. utilities --------------------------------------------------------
+
+def stable_mean(fxs):
+    """Numerically stable mean of a 1‑D tensor that may contain small values."""
+    jitter = 1e-30
+
+    stable_mean_psve_only = lambda fs, n: torch.exp(
+        torch.logsumexp(torch.log(fs + jitter), dim=1) - torch.log(torch.tensor(n, device=fs.device) + jitter)
+    )
+
+    f_xs_psve = fxs * (fxs > 0.0)
+    f_xs_ngve = -fxs * (fxs < 0.0)
+    n_psve = torch.sum((fxs > 0.0))
+    n_ngve = fxs.numel() - n_psve
+    avg_psve = stable_mean_psve_only(f_xs_psve, n_psve)
+    avg_ngve = stable_mean_psve_only(f_xs_ngve, n_ngve)
+
+    return (n_psve / fxs.numel()) * avg_psve - (n_ngve / fxs.numel()) * avg_ngve
+
+
+# ---- Log‑joint --------------------------------------------------------------
+
+def log_joint(data, params, hparams):
+    """Log‑joint p(D, Z, Θ, G)."""
+    d = data["x"].shape[-1]
+    gmat = params["hard_gmat"]
+
+    pred_mean_x = lambda x_, ps: x_ @ (
+        soft_gmat(params["z"], hparams) * ps["theta"]
+    )
+
+    loglik_x = loglik_gaussian(data["x"], pred_mean_x(data["x"], params), hparams["sigma"])
+
+    # Expert feedback likelihood currently disabled
+    loglik_y = torch.tensor(0.0, device=device)
+
+    log_prob_g_given_z = torch.sum(
+        torch.distributions.Bernoulli(soft_gmat(params["z"], hparams)).log_prob(gmat.round())
+    )
+
+    log_prior_z_constraint = -hparams["beta"] * acyclic_constr_mc_gumbel(params["z"], hparams)
+
+    log_prior_z_regularizer = torch.sum(
+        torch.distributions.Normal(
+            torch.zeros_like(params["z"]),
+            torch.ones_like(params["z"]) / torch.sqrt(torch.tensor(d, device=params["z"].device)),
+        ).log_prob(params["z"])
+    )
+
+    log_prior_z = log_prior_z_constraint + log_prior_z_regularizer
+
+    log_prior_theta = torch.sum(
+        torch.distributions.Normal(
+            torch.zeros_like(params["theta"]),
+            torch.ones_like(params["theta"]),
+        ).log_prob(params["theta"] * gmat)
+    )
+
+    return loglik_x + loglik_y + log_prob_g_given_z + log_prior_z + log_prior_theta
+
+
+# ---- Score‑function & gradient estimators -----------------------------------
+
+def score_func_estimator_stable(params, hparams, log_f, normalized=True):
+    hard_gmats = params["hard_gmats"]
+    _n_mc = hard_gmats.shape[0]
+
+    log_fs = torch.func.vmap(log_f, randomness="different")(hard_gmats)
+
+    score_func = lambda g: torch.autograd.grad(
+        torch.distributions.Bernoulli(soft_gmat(params["z"], hparams)).log_prob(g).sum(),
+        params["z"],
+        create_graph=True,
+    )[0]
+
+    scores = torch.stack([score_func(g) for g in hard_gmats])
+
+    while log_fs.dim() < scores.dim():
+        log_fs = log_fs.unsqueeze(-1)
+
+    log_numerator = torch.logsumexp(log_fs + torch.log(torch.abs(scores)) * torch.sign(scores), dim=0)
+
     if normalized:
-        log_denom = torch.logsumexp(log_f, dim=0)
-        return torch.exp(log_num - log_denom)
-    return torch.exp(log_num)
+        log_denominator = torch.logsumexp(log_fs, dim=0)
+        result = torch.exp(log_numerator - log_denominator)
+    else:
+        result = torch.exp(log_numerator - torch.log(torch.tensor(_n_mc, device=scores.device)))
+
+    return result
 
 
-def grad_theta_score(z: torch.Tensor, data: Dict[str, Any], theta: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
-    """Fully vectorised Monte-Carlo gradient wrt theta."""
-    S = hparams.get("n_mc_samples", 64)
-    g_hard = Bernoulli(soft_gmat(z, hparams)).sample((S,))  # (S,d,d)
+def grad_z_neg_log_joint(data, params, hparams):
+    _n_mc = params["hard_gmats"].shape[0]
+    d = params["z"].shape[0]
 
-    # Expand theta to batch & keep track of grads via functorch
-    theta_batched = theta.expand(S, *theta.shape).clone()
+    h_grad = (
+        lambda g: acyclic_constr(g) * torch.autograd.grad(
+            torch.distributions.Bernoulli(soft_gmat(params["z"], hparams)).log_prob(g).sum(),
+            params["z"],
+            create_graph=True,
+        )[0]
+    )
 
-    def log_density_single(th, g):
-        return (
-            log_full_likelihood(data, g, th, hparams)
-            + log_theta_prior(th * g, hparams.get("theta_prior_sigma", 1.0))
-        )
+    h_grads = torch.stack([h_grad(params["hard_gmats"][i]) for i in range(_n_mc)])
+    grad_z_log_prior_acyclic_constr = -hparams["beta"] * torch.mean(h_grads, dim=0)
+    grad_log_prior_z_regularizer = -(1 / torch.tensor(d, device=params["z"].device)) * params["z"]
+    grad_z_log_prior_z = grad_z_log_prior_acyclic_constr + grad_log_prior_z_regularizer
 
-    # Vectorised log-density
-    log_densities = torch.func.vmap(log_density_single)(theta_batched, g_hard)  # (S,)
+    grad_z_log_likelihood = score_func_estimator_stable(
+        params, hparams, lambda g: log_joint(data, params | {"hard_gmat": g}, hparams)
+    )
+    return -(grad_z_log_prior_z + grad_z_log_likelihood)
 
-    # Vectorised gradient w.r.t first argument (theta)
-    grad_fn = torch.func.grad(log_density_single)
-    grad_samples = torch.func.vmap(grad_fn)(theta_batched, g_hard)  # (S,d,d)
 
-    return stable_ratio(grad_samples, log_densities)
+def grad_theta_neg_log_joint(data, params, hparams):
+    hard_gmats = params["hard_gmats"]
+    _n_mc = hard_gmats.shape[0]
 
-# -----------------------------------------------------------------------------
-# Gradients for z (uses the new score func estimator)
-# -----------------------------------------------------------------------------
+    log_fs = torch.tensor(
+        [log_joint(data, {**params, "hard_gmat": hard_gmats[i]}, hparams) for i in range(_n_mc)],
+        device=device,
+    )
 
-def grad_z_score_stable(z: torch.Tensor, data: Dict[str, Any], theta: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
-    grad_z_prior = -(z / hparams["sigma_z"] ** 2)
+    score_func = lambda g: torch.autograd.grad(
+        log_joint(data, {**params, "hard_gmat": g}, hparams),
+        params["theta"],
+        create_graph=True,
+    )[0]
 
-    def f_likelihood(g):
-        return log_full_likelihood(data, g, theta, hparams) + log_theta_prior(theta * g, hparams["theta_prior_sigma"])
+    scores = torch.clamp(torch.stack([score_func(g) for g in hard_gmats]), min=1e-32)
 
-    grad_lik = score_func_estimator_stable(data, z, hparams, f_likelihood, normalized=True)
+    while log_fs.dim() < scores.dim():
+        log_fs = log_fs.unsqueeze(-1)
 
-    def f_acyclic(g):
-        d = z.shape[0]
-        return acyclic_constr(g, d)
+    log_numerator = torch.logsumexp(log_fs + torch.log(torch.abs(scores)) * torch.sign(scores), dim=0)
+    log_denominator = torch.logsumexp(log_fs, dim=0)
 
-    grad_acyc = score_func_estimator_stable(data, z, hparams, f_acyclic, normalized=False)
+    return -torch.exp(log_numerator - log_denominator)
 
-    return grad_z_prior + grad_lik - hparams["beta"] * grad_acyc
 
-# -----------------------------------------------------------------------------
-# Top-level joint gradient & (optional) compile for PyTorch ≥ 2.0
-# -----------------------------------------------------------------------------
-
-def grad_log_joint(params: Dict[str, torch.Tensor], data: Dict[str, Any], hparams: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
-    grad_z = grad_z_score_stable(params["z"], data, params["theta"].detach(), hparams)
-    grad_theta = grad_theta_score(params["z"].detach(), data, params["theta"], hparams)
-    return grad_z, grad_theta
-
-# Try TorchDynamo / Triton compile if available (PyTorch ≥ 2.0)
-try:
-    grad_log_joint = torch.compile(grad_log_joint)  # type: ignore
-    log.info("Using torch.compile for grad_log_joint speed-up.")
-except Exception as e:
-    log.info(f"torch.compile unavailable or failed ({e}); continuing without it.")
-
-# -----------------------------------------------------------------------------
-# Fast version of log_joint (batch acyclicity)
-# -----------------------------------------------------------------------------
-
-def log_joint(params: Dict[str, Any], data: Dict[str, Any], hparams: Dict[str, Any]) -> torch.Tensor:
-    z, theta = params["z"], params["theta"]
-    g_soft = soft_gmat(z, hparams)
-    ll = log_full_likelihood(data, g_soft, theta, hparams)
-    lp_theta = log_theta_prior(theta, hparams.get("sigma_theta_prior", 1.0))
-
-    with torch.no_grad():
-        S = hparams.get("n_mc_samples", 64)
-        g_hard = Bernoulli(g_soft).sample((S,))
-        d = z.shape[0]
-        h_vals = acyclic_constr(g_hard, d)  # vectorised call -> (S,)
-        acyclicity_val = h_vals.mean()
-
-    lp_z = -0.5 * torch.sum(z ** 2) / hparams.get("latent_prior_std", 1.0) ** 2
-    return ll + lp_theta + lp_z - hparams["beta"] * acyclicity_val
-
-# -----------------------------------------------------------------------------
-# Data generation helpers (device-aware)
-# -----------------------------------------------------------------------------
-
-def generate_chain(num_samples, chain_length, obs_noise_std, device):
-    G_true = torch.zeros(chain_length, chain_length, dtype=torch.float32, device=device)
-    for i in range(chain_length - 1):
-        G_true[i, i + 1] = 1.0
-    Theta_true = torch.zeros_like(G_true)
-    Theta_true[:-1, 1:] = torch.tensor([2.0, -1.5], device=device).unsqueeze(1)[: chain_length - 1]
-    X_data = torch.zeros(num_samples, chain_length, device=device)
-    X_data[:, 0] = torch.randn(num_samples, device=device) * obs_noise_std
-    for i in range(1, chain_length):
-        noise = torch.randn(num_samples, device=device) * obs_noise_std
-        X_data[:, i] = Theta_true[i - 1, i] * X_data[:, i - 1] + noise
-    return X_data, G_true, Theta_true
-
-# -----------------------------------------------------------------------------
-# Config and training loop (AMP enabled)
-# -----------------------------------------------------------------------------
-
-class Config:
-    seed = 31
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    d_nodes = 3
-    num_samples = 1000
-    obs_noise_std = 0.1
-    k_latent = d_nodes
-    alpha_base = 0.2
-    beta_base = 1.0
-    theta_prior_sigma = 1.0
-    n_mc_samples = 128
-    lr = 5e-3
-    num_iterations = 1500
-    debug_print_iter = 100
-
-cfg = Config()
-
-def update_dibs_hparams(hparams: Dict[str, Any], t: int) -> Dict[str, Any]:
-    hparams["alpha"] = hparams["alpha_base"] * t * 0.02
-    hparams["beta"] = hparams["beta_base"] * t * 0.1
-    hparams["current_t"] = t
-    return hparams
-
-# ----------------------------------------------------------------------------
-# Training utilities (unchanged apart from device placement)
-# ----------------------------------------------------------------------------
-
-def debug_prediction_error(params, data, hparams, G_true):
-    with torch.no_grad():
-        z, theta = params["z"], params["theta"]
-        x_data = data["x"]
-        sigma_obs = hparams["sigma_obs_noise"]
-        g_probs = soft_gmat(z, hparams)
-        g_learned = torch.bernoulli(g_probs)
-        pred_mean = torch.matmul(x_data, theta * g_learned)
-        residuals = x_data - pred_mean
-        mse = torch.mean(residuals ** 2)
-        mae = torch.mean(torch.abs(residuals))
-        shd = torch.sum(torch.abs(g_learned.cpu() - G_true.cpu()))
-        log.info(f"SHD: {shd.item():.1f} | MSE: {mse.item():.6f} | MAE: {mae.item():.6f}")
-
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
-
-def main():
-    torch.manual_seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    torch.backends.cudnn.benchmark = True
-    log.info(f"Running on device: {cfg.device}")
-
-    # --- Data ---
-    X, G_true, Theta_true = generate_chain(cfg.num_samples, cfg.d_nodes, cfg.obs_noise_std, cfg.device)
-    data = {"x": X}
-
-    # --- Parameters ---
-    particle = {
-        "z": nn.Parameter(torch.randn(cfg.d_nodes, cfg.k_latent, 2, device=cfg.device)),
-        "theta": nn.Parameter(torch.randn(cfg.d_nodes, cfg.d_nodes, device=cfg.device)),
-    }
-
-    hparams = {
-        "alpha": 0.0,
-        "beta": 0.0,
-        "alpha_base": cfg.alpha_base,
-        "beta_base": cfg.beta_base,
-        "sigma_z": 1.0 / np.sqrt(cfg.k_latent),
-        "sigma_obs_noise": cfg.obs_noise_std,
-        "theta_prior_sigma": cfg.theta_prior_sigma,
-        "n_mc_samples": cfg.n_mc_samples,
-    }
-
-    optimizer = torch.optim.RMSprop(particle.values(), lr=cfg.lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=(cfg.device == "cuda"))
-
-    log.info("Starting training ...")
-    for t in range(1, cfg.num_iterations + 1):
-        optimizer.zero_grad()
-        update_dibs_hparams(hparams, t)
-        with torch.cuda.amp.autocast(enabled=(cfg.device == "cuda")):
-            grad_z, grad_th = grad_log_joint(particle, data, hparams)
-        # Assign ascent gradients
-        particle["z"].grad = -grad_z
-        particle["theta"].grad = -grad_th
-        scaler.step(optimizer) if cfg.device == "cuda" else optimizer.step()
-        if cfg.device == "cuda":
-            scaler.update()
-        if t % cfg.debug_print_iter == 0:
-            debug_prediction_error(particle, data, hparams, G_true)
-
-    log.info("Training finished.")
+# --------------------------------------------------
+#  Main experiment
+# --------------------------------------------------
 
 if __name__ == "__main__":
-    main() 
+    torch.manual_seed(42)
+
+    # ---------------------  synthetic data  ---------------------------------
+    N, d = 100, 3
+    sigma = 0.1 * torch.ones((d,), device=device)
+
+    gt_gmat = torch.diag(torch.ones(d - 1, device=device), diagonal=1)
+    gt_theta = 5 * torch.rand((d, d), device=device)
+
+    exog_noise = torch.normal(
+        torch.zeros((N, d), device=device), sigma * torch.ones((N, d), device=device)
+    )
+    x = exog_noise @ (gt_gmat * gt_theta)
+
+    data = {"x": x, "y": {}}
+
+    # ---------------------  hyper‑parameters  --------------------------------
+    hparams = {
+        "lr": 0.001,
+        "sigma": sigma,
+        "alpha": 0.01,
+        "beta": 1,
+        "tau": 1.0,
+        "n_gumbel_mc_samples": 128,
+        "n_grad_mc_samples": 16,
+        "rho": 1.0,
+        "minibatch_size": N,
+        "n_score_func_mc_samples": 1024,
+    }
+
+    update_hparams = lambda hps, t: {
+        **hps,
+        "alpha": hps["alpha"] * (t + 1) / t,
+        "beta": hps["beta"] * (t + 1) / t,
+        # "tau": hps["tau"] * (t + 1) / t,
+    }
+
+    # ---------------------  parameters & optimiser  -------------------------
+    params = {
+        "z": torch.randn((d, d, 2), device=device, requires_grad=True),
+        "theta": torch.randn((d, d), device=device, requires_grad=True),
+    }
+    optimizer = torch.optim.RMSprop(list(params.values()), lr=hparams["lr"])
+
+    # ---------------------  gradient ascent ----------------------------------
+    iters = 501
+    for t in range(1, iters):
+        optimizer.zero_grad()
+
+        _soft_gmat = soft_gmat(params["z"], hparams)
+        distr = torch.distributions.Bernoulli(_soft_gmat)
+        hard_gmats = distr.sample((hparams["n_score_func_mc_samples"],))
+
+        # Detach to block gradients where appropriate
+        grad_z = grad_z_neg_log_joint(
+            data,
+            {**params, "hard_gmats": hard_gmats, "theta": params["theta"].detach()},
+            hparams,
+        )
+        grad_theta = grad_theta_neg_log_joint(
+            data,
+            {**params, "hard_gmats": hard_gmats, "z": params["z"].detach()},
+            hparams,
+        )
+
+        # Manually assign grads
+        params["z"].grad = grad_z
+        params["theta"].grad = grad_theta
+
+        optimizer.step()
+        hparams = update_hparams(hparams, t)
+
+        # ---- logging every 10 iters
+        if t % 10 == 0:
+            grad_z_norm = grad_z.abs().mean().detach().cpu().item()
+            grad_theta_norm = grad_theta.abs().mean().detach().cpu().item()
+            print(f"t={t:04d} | grad_z_norm={grad_z_norm:.3e} | grad_theta_norm={grad_theta_norm:.3e}")
+
+            current_params = {**params, "hard_gmat": hard_gmat(params["z"])}
+            lj = log_joint(data, current_params, hparams).detach().cpu().item()
+            print(f"           log_joint={lj:.2f}")
+
+    # ---------------------  visualisation ------------------------------------
+    learnt_soft_gmat = soft_gmat(params["z"], {"alpha": 1.0}).detach().cpu().numpy()
+    learnt_hard_gmat = (learnt_soft_gmat > 0.5).astype(np.float32)
+    learnt_theta = params["theta"].detach().cpu().numpy()
+
+    for i, matrix in enumerate([gt_gmat.cpu().numpy() * gt_theta.cpu().numpy(), learnt_hard_gmat * learnt_theta], 1):
+        plt.subplot(1, 2, i)
+        plt.imshow(matrix, cmap="viridis")
+        for (x_, y_), val in np.ndenumerate(matrix):
+            plt.text(y_, x_, f"{val:.2f}", ha="center", va="center", color="white")
+
+    plt.show()
