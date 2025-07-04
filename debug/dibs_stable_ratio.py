@@ -7,6 +7,8 @@ import torch.nn as nn
 import igraph as ig  
 
 DEBUG_PRINT_ITER = 100
+ALPHA = 0.02
+BETA = 1
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger()
@@ -86,7 +88,7 @@ def stable_ratio(grad_samples, log_density_samples):
 
     log_num_pos = torch.logsumexp(
         torch.where(pos,
-                    torch.log(grads.abs() + eps) + log_p,
+                    torch.log(grads + eps) + log_p,
                     torch.full_like(log_p, -float('inf'))),
         dim=0) - torch.log(torch.tensor(len(log_p), dtype=log_p.dtype, device=log_p.device))
 
@@ -396,8 +398,8 @@ def update_dibs_hparams(hparams: Dict[str, Any], t: int) -> Dict[str, Any]:
     """
     # Simple linear annealing
 
-    hparams['alpha'] = hparams['alpha_base'] * t*0.2
-    hparams['beta'] = hparams['beta_base'] * t * 0.1
+    hparams['alpha'] = hparams['alpha_base'] * t
+    hparams['beta'] = hparams['beta_base'] * t
     hparams['current_t'] = t
     return hparams
 
@@ -606,8 +608,8 @@ class Config:
 
     # --- Model ---
     k_latent = d_nodes
-    alpha_base = 0.2  # Base value for annealing
-    beta_base = 1.0   # Base value for annealing
+    alpha_base = ALPHA  # Base value for annealing
+    beta_base = BETA   # Base value for annealing
     theta_prior_sigma = 1.0
     
     # --- MC Sampling ---
