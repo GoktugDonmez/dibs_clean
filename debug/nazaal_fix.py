@@ -297,36 +297,30 @@ def score_func_estimator_stable(params, hparams, log_f, normalized=True):
     return result
 
 
-def grad_z_neg_log_joint(data, params, hparams):
+def grad_z_neg_log_joint(data, params, hparams, hard_gmats=None):
     d = params["z"].shape[0]
-    #grad_z_log_prior_acyclic_constr = -hparams["beta"] * score_func_estimator_stable(
-    #    params,
-    #    hparams,
-    #    lambda g: torch.log(torch.clamp(acyclic_constr(g), 1e-32)),
-    #    normalized=False,
-    #)
     grad_log_prior_z_regularizer = -(1 / torch.sqrt(torch.tensor(d))) * params["z"]
-    #grad_z_log_prior_z = grad_z_log_prior_acyclic_constr + grad_log_prior_z_regularizer
 
-    #grad_z_log_likelihood = score_func_estimator_stable(
-    #    params,
-    #    hparams,
-    #    lambda g: log_joint(data, params | {"hard_gmat": g}, hparams),
-    #    normalized=True,
-    #)
+    # Sample hard_gmats once if not provided
+    if hard_gmats is None:
+        _n_mc = hparams["n_score_func_mc_samples"]
+        hard_gmats = []
+        for i in range(_n_mc):
+            hard_gmat = torch.distributions.Bernoulli(soft_gmat(params["z"], hparams)).sample()
+            hard_gmats.append(hard_gmat)
+
     # calculate the likelihood with stable ratio
     log_fs = []
     scores = []
     grad_prior_acyclic_constr_total = 0.0
-    for i in range(hparams["n_score_func_mc_samples"]):
-        hard_gmat = torch.distributions.Bernoulli(soft_gmat(params["z"], hparams)).sample()
+    for i, hard_gmat in enumerate(hard_gmats):
         log_f = log_joint(data, params | {"hard_gmat": hard_gmat}, hparams)
         grad = torch.autograd.grad(log_f, params["z"], create_graph=True)[0]
         log_fs.append(log_f)
         scores.append(grad)
 
-        grad_prior_acyclic_constr_total +=  acyclic_constr(hard_gmat)*grad
-    grad_prior_acyclic_constr_total /= hparams["n_score_func_mc_samples"]
+        grad_prior_acyclic_constr_total += acyclic_constr(hard_gmat) * grad
+    grad_prior_acyclic_constr_total /= len(hard_gmats)
     grad_prior_acyclic_constr = -hparams["beta"] * grad_prior_acyclic_constr_total
 
     grad_z_log_likelihood = -stable_ratio(scores, log_fs)
@@ -337,10 +331,12 @@ def grad_z_neg_log_joint(data, params, hparams):
     return -result
 
 
-def grad_theta_neg_log_joint(data, params, hparams):
+def grad_theta_neg_log_joint(data, params, hparams, hard_gmats=None):
     _n_mc = hparams["n_score_func_mc_samples"]
-    distr = torch.distributions.Bernoulli(soft_gmat(params["z"], hparams))
-    hard_gmats = distr.sample((_n_mc,))
+    
+    if hard_gmats is None:
+        distr = torch.distributions.Bernoulli(soft_gmat(params["z"], hparams))
+        hard_gmats = distr.sample((_n_mc,))
 
     log_fs = torch.tensor(
         [
@@ -404,12 +400,18 @@ if __name__ == "__main__":
     for t in range(1, iters):
         optimizer.zero_grad()
 
+        # Sample hard_gmats once per iteration for consistency
+        _n_mc = hparams["n_score_func_mc_samples"]
+        _soft_gmat = soft_gmat(params["z"], hparams)
+        distr = torch.distributions.Bernoulli(_soft_gmat)
+        hard_gmats = distr.sample((_n_mc,))
+
         # Detaching params not relevant to the gradients being computed
         grad_z = grad_z_neg_log_joint(
-            data, {**params, "theta": params["theta"].detach()}, hparams
+            data, {**params, "theta": params["theta"].detach()}, hparams, hard_gmats
         )
         grad_theta = grad_theta_neg_log_joint(
-            data, {**params, "z": params["z"].detach()}, hparams
+            data, {**params, "z": params["z"].detach()}, hparams, hard_gmats
         )
         grads = {"z": grad_z, "theta": grad_theta}
         for name, param in params.items():

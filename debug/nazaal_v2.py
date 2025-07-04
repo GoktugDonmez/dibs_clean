@@ -164,31 +164,14 @@ def log_joint(data, params, hparams):
     return loglik_x + loglik_y + log_prob_g_given_z + log_prior_z + log_prior_theta
 
 
-def update_dibs_hparams(hparams, t):
-    # NOTE these values become tracers, so the hparam dict used for
-    # inference cannot be used later in utility computations
-    # way to get around this is to update d.copy()
-    if not isinstance(hparams, dict):
-        # Conversion needed since _partial_ instantiation in hydra
-        # makes hparams an OmegaConf.dictconf
-        pass
-        # hparams = OmegaConf.to_container(hparams, resolve=True)
-
-    updated_hparams = hparams.copy()
-    updated_hparams["tau"] = hparams["tau"]  # hparams["tau"] * (t + 1 / t)
-    updated_hparams["alpha"] = hparams["alpha"] * (t + 1 / t)
-    updated_hparams["beta"] = hparams["beta"] * (t + 1 / t)
-    return updated_hparams
-
-
-def score_func_estimator_stable(params, hparams, log_f, hard_gmats=None, normalized=True):
+def score_func_estimator_stable(params, hparams, log_f, normalized=True):
     # f is a function G, as in Equation B.8
-    _n_mc = hparams["n_score_func_mc_samples"]
-    _soft_gmat = soft_gmat(params["z"], hparams)
-    
-    if hard_gmats is None:
-        distr = torch.distributions.Bernoulli(_soft_gmat)
-        hard_gmats = distr.sample((_n_mc,))
+    # _n_mc = hparams["n_score_func_mc_samples"]
+    # _soft_gmat = soft_gmat(params["z"], hparams)
+    # distr = torch.distributions.Bernoulli(_soft_gmat)
+    # hard_gmats = distr.sample((_n_mc,))
+    hard_gmats = params["hard_gmats"]
+    _n_mc = hard_gmats.shape[0]
 
     # log joint densities, for all Gs
     log_fs = torch.func.vmap(
@@ -226,17 +209,9 @@ def score_func_estimator_stable(params, hparams, log_f, hard_gmats=None, normali
     return result
 
 
-def grad_z_neg_log_joint(data, params, hparams, hard_gmats=None):
+def grad_z_neg_log_joint(data, params, hparams):
+    _n_mc = params["hard_gmats"].shape[0]
     d = params["z"].shape[0]
-    
-    # Sample hard_gmats once if not provided
-    if hard_gmats is None:
-        _n_mc = hparams["n_score_func_mc_samples"]
-        _soft_gmat = soft_gmat(params["z"], hparams)
-        distr = torch.distributions.Bernoulli(_soft_gmat)
-        hard_gmats = distr.sample((_n_mc,))
-    _n_mc = hparams["n_score_func_mc_samples"]
-
     h_grad = (
         lambda g: acyclic_constr(g)
         * torch.autograd.grad(
@@ -249,20 +224,18 @@ def grad_z_neg_log_joint(data, params, hparams, hard_gmats=None):
     )
     # Important to compute gradients of acyclicity constraint without logsumexp,
     # since the h(G) function can often be 0.
-    h_grads = torch.stack([h_grad(hard_gmats[i]) for i in range(_n_mc)])
+    h_grads = torch.stack([h_grad(params["hard_gmats"][i]) for i in range(_n_mc)])
     grad_z_log_prior_acyclic_constr = -hparams["beta"] * torch.mean(
         h_grads,
         dim=0,
     )
-
-    grad_log_prior_z_regularizer = -(1 / torch.sqrt(torch.tensor(d))) * params["z"]
+    grad_log_prior_z_regularizer = -(1 / torch.tensor(d)) * params["z"]
     grad_z_log_prior_z = grad_z_log_prior_acyclic_constr + grad_log_prior_z_regularizer
 
     grad_z_log_likelihood = score_func_estimator_stable(
         params,
         hparams,
         lambda g: log_joint(data, params | {"hard_gmat": g}, hparams),
-        hard_gmats=hard_gmats,
         normalized=True,
     )
     result = grad_z_log_prior_z + grad_z_log_likelihood
@@ -270,12 +243,17 @@ def grad_z_neg_log_joint(data, params, hparams, hard_gmats=None):
     return -result
 
 
-def grad_theta_neg_log_joint(data, params, hparams, hard_gmats=None):
-    _n_mc = hparams["n_score_func_mc_samples"]
-    
-    if hard_gmats is None:
-        distr = torch.distributions.Bernoulli(soft_gmat(params["z"], hparams))
-        hard_gmats = distr.sample((_n_mc,))
+def grad_z_neg_log_joint_reparam(data, params, hparams):
+    pass
+
+
+def grad_theta_neg_log_joint(data, params, hparams):
+    # _n_mc = hparams["n_score_func_mc_samples"]
+    # distr = torch.distributions.Bernoulli(soft_gmat(params["z"], hparams))
+    # hard_gmats = distr.sample((_n_mc,))
+    # print(f"theta_hard_gmats={torch.mean(hard_gmats, dim=0)}")
+    hard_gmats = params["hard_gmats"]
+    _n_mc = hard_gmats.shape[0]
 
     log_fs = torch.tensor(
         [
@@ -290,7 +268,7 @@ def grad_theta_neg_log_joint(data, params, hparams, hard_gmats=None):
     )[0]
 
     # grad_Theta log p(Theta, D|G) for all Gs
-    scores = torch.stack([score_func(g) for g in hard_gmats]) + 1e-32
+    scores = torch.clamp(torch.stack([score_func(g) for g in hard_gmats]), min=1e-32)
 
     while log_fs.dim() < scores.dim():
         log_fs = log_fs.unsqueeze(-1)
@@ -307,7 +285,7 @@ def grad_theta_neg_log_joint(data, params, hparams, hard_gmats=None):
 if __name__ == "__main__":
     torch.manual_seed(42)
     # Parameter
-    N, d = 100, 5
+    N, d = 100, 3
     sigma = 0.1 * torch.ones((d,))
     gt_gmat = torch.diag(torch.ones(d - 1), diagonal=1)
     gt_theta = 5 * torch.rand((d, d))
@@ -316,16 +294,16 @@ if __name__ == "__main__":
 
     data = {"x": x, "y": {}}
     hparams = {
-        "lr": 0.01,
+        "lr": 0.001,
         "sigma": sigma,
         "alpha": 0.01,
-        "beta": 0.1,
+        "beta": 1,
         "tau": 1.0,
         "n_gumbel_mc_samples": 128,
         "n_grad_mc_samples": 16,
         "rho": 1.0,
         "minibatch_size": N,
-        "n_score_func_mc_samples": 512,
+        "n_score_func_mc_samples": 1024,
     }
 
     update_hparams = lambda hps, t: {
@@ -343,19 +321,20 @@ if __name__ == "__main__":
     optimizer = torch.optim.RMSprop(list(params.values()), lr=hparams["lr"])
     for t in range(1, iters):
         optimizer.zero_grad()
-
-        # Sample hard_gmats once per iteration for consistency
-        _n_mc = hparams["n_score_func_mc_samples"]
         _soft_gmat = soft_gmat(params["z"], hparams)
         distr = torch.distributions.Bernoulli(_soft_gmat)
-        hard_gmats = distr.sample((_n_mc,))
+        hard_gmats = distr.sample((hparams["n_score_func_mc_samples"],))
 
         # Detaching params not relevant to the gradients being computed
         grad_z = grad_z_neg_log_joint(
-            data, {**params, "theta": params["theta"].detach()}, hparams, hard_gmats
+            data,
+            {**params, "hard_gmats": hard_gmats, "theta": params["theta"].detach()},
+            hparams,
         )
         grad_theta = grad_theta_neg_log_joint(
-            data, {**params, "z": params["z"].detach()}, hparams, hard_gmats
+            data,
+            {**params, "hard_gmats": hard_gmats, "z": params["z"].detach()},
+            hparams,
         )
         grads = {"z": grad_z, "theta": grad_theta}
         for name, param in params.items():
@@ -366,8 +345,13 @@ if __name__ == "__main__":
         hparams = update_hparams(hparams, t)
 
         if t % 10 == 0:
+            grad_z_norm = torch.mean(torch.abs(grads["z"])).float().detach().numpy()
+            grad_theta_norm = (
+                torch.mean(torch.abs(grads["theta"])).float().detach().numpy()
+            )
+            print(f"{grad_z_norm=}, {grad_theta_norm=}")
             _params = {**params, "hard_gmat": hard_gmat(params["z"])}
-            print(f"log_joint = {log_joint(data, _params, hparams)}")
+            print(f"{log_joint(data, _params, hparams)=}")
 
     # Plot results
     learnt_soft_gmat = soft_gmat(params["z"], {"alpha": 1.0})
