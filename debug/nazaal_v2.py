@@ -108,7 +108,7 @@ def stable_mean(fxs):
     return (n_psve / fxs.size) * avg_psve - (n_ngve / fxs.size) * avg_ngve
 
 
-def log_joint(data, params, hparams):
+def log_joint_z(data, params, hparams):
     # log joint as a function of Z, Theta which are both in the params dict
 
     d = data["x"].shape[-1]
@@ -160,8 +160,37 @@ def log_joint(data, params, hparams):
             torch.ones_like(params["theta"]),
         ).log_prob(params["theta"] * gmat)
     )
+    if params["theta"].requires_grad:
+        return loglik_x + loglik_y + log_prior_theta
 
     return loglik_x + loglik_y + log_prob_g_given_z + log_prior_z + log_prior_theta
+
+def log_joint_theta(data, params, hparams):
+    """
+    Computes the log of p(D, Theta | G), which is composed of:
+    - Data likelihood: log p(D | G, Theta)
+    - Theta prior:   log p(Theta | G)
+    This is the required term for calculating the gradient with respect to Theta.
+    """
+    gmat = params["hard_gmat"]
+    
+    # Data likelihood: log p(D | G, Theta)
+    # Using soft_gmat for the prediction but hard gmat for the prior on theta
+    pred_mean_x = lambda x, ps: x @ (soft_gmat(params["z"], hparams) * ps["theta"])
+    loglik_x = loglik_gaussian(
+        data["x"], pred_mean_x(data["x"], params), hparams["sigma"]
+    )
+    loglik_y = 0.0 # Placeholder for expert feedback
+
+    # Theta prior: log p(Theta | G)
+    log_prior_theta = torch.sum(
+        torch.distributions.Normal(
+            torch.zeros_like(params["theta"]),
+            torch.ones_like(params["theta"]),
+        ).log_prob(params["theta"] * gmat) # The prior only applies to weights for existing edges
+    )
+
+    return loglik_x + loglik_y + log_prior_theta
 
 
 def score_func_estimator_stable(params, hparams, log_f, normalized=True):
@@ -235,7 +264,7 @@ def grad_z_neg_log_joint(data, params, hparams):
     grad_z_log_likelihood = score_func_estimator_stable(
         params,
         hparams,
-        lambda g: log_joint(data, params | {"hard_gmat": g}, hparams),
+        lambda g: log_joint_z(data, params | {"hard_gmat": g}, hparams),
         normalized=True,
     )
     result = grad_z_log_prior_z + grad_z_log_likelihood
@@ -253,16 +282,17 @@ def grad_theta_neg_log_joint(data, params, hparams):
     # hard_gmats = distr.sample((_n_mc,))
     # print(f"theta_hard_gmats={torch.mean(hard_gmats, dim=0)}")
     hard_gmats = params["hard_gmats"]
+    soft_gmat = params["soft_gmat"]
     _n_mc = hard_gmats.shape[0]
 
     log_fs = torch.tensor(
         [
-            log_joint(data, {**params, "hard_gmat": hard_gmats[i]}, hparams)
+            log_joint_theta(data, {**params, "hard_gmat": hard_gmats[i]}, hparams)
             for i in range(_n_mc)
         ]
     )
     score_func = lambda g: torch.autograd.grad(
-        log_joint(data, {**params, "hard_gmat": g}, hparams),
+        log_joint_theta(data, {**params, "hard_gmat": g}, hparams),
         params["theta"],
         create_graph=True,
     )[0]
@@ -328,12 +358,12 @@ if __name__ == "__main__":
         # Detaching params not relevant to the gradients being computed
         grad_z = grad_z_neg_log_joint(
             data,
-            {**params, "hard_gmats": hard_gmats, "theta": params["theta"].detach()},
+            {**params, "hard_gmats": hard_gmats, "soft_gmat": _soft_gmat, "theta": params["theta"].detach()},
             hparams,
         )
         grad_theta = grad_theta_neg_log_joint(
             data,
-            {**params, "hard_gmats": hard_gmats, "z": params["z"].detach()},
+            {**params, "hard_gmats": hard_gmats, "soft_gmat": _soft_gmat, "z": params["z"].detach()},
             hparams,
         )
         grads = {"z": grad_z, "theta": grad_theta}
@@ -351,7 +381,7 @@ if __name__ == "__main__":
             )
             print(f"{grad_z_norm=}, {grad_theta_norm=}")
             _params = {**params, "hard_gmat": hard_gmat(params["z"])}
-            print(f"{log_joint(data, _params, hparams)=}")
+            print(f"{log_joint_z(data, _params, hparams)=}")
             print(f"soft_gmat={soft_gmat(params['z'], hparams)}")
 
     # Plot results

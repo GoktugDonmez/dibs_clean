@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import argparse
+
 
 def loglik_gaussian(x, pred_mean, sigma):
     assert sigma.shape[0] == pred_mean.shape[-1]
@@ -52,7 +52,7 @@ def grad_z_log_joint_gumbel(data, params, hparams):
     return grad_z_log_joint
 
 
-def hard_gmat(z, hparams):
+def hard_gmat(z):
     d = z.shape[0]
     cycle_mask = 1.0 - torch.eye(d)
     inner_product_scores = torch.einsum("ik, jk -> ij", z[:, :, 0], z[:, :, 1])
@@ -108,7 +108,7 @@ def stable_mean(fxs):
     return (n_psve / fxs.size) * avg_psve - (n_ngve / fxs.size) * avg_ngve
 
 
-def log_joint(data, params, hparams, gmat_in_score_func, estimator_gmat):
+def log_joint(data, params, hparams):
     # log joint as a function of Z, Theta which are both in the params dict
 
     d = data["x"].shape[-1]
@@ -117,13 +117,8 @@ def log_joint(data, params, hparams, gmat_in_score_func, estimator_gmat):
     # passed around nicely, e.g. wrt theta
     gmat = params["hard_gmat"]
 
-    if gmat_in_score_func == "hard":
-        gmat_for_pred = gmat
-    else:
-        gmat_for_pred = soft_gmat(params["z"], hparams)
-
     pred_mean_x = lambda x, ps: x @ (
-        gmat_for_pred * ps["theta"]
+        soft_gmat(params["z"], hparams) * ps["theta"]
     )  # Note: Will change to use a neural network later
     #
     loglik_x = loglik_gaussian(
@@ -214,16 +209,9 @@ def score_func_estimator_stable(params, hparams, log_f, normalized=True):
     return result
 
 
-def grad_z_neg_log_joint(data, params, hparams, gmat_in_score_func, estimator_gmat):
+def grad_z_neg_log_joint(data, params, hparams):
     _n_mc = params["hard_gmats"].shape[0]
     d = params["z"].shape[0]
-    
-    if estimator_gmat == "hard":
-        estimator_gmats = params["hard_gmats"]
-    else:
-        estimator_gmats = soft_gmat(params["z"], hparams)
-
-
     h_grad = (
         lambda g: acyclic_constr(g)
         * torch.autograd.grad(
@@ -236,7 +224,7 @@ def grad_z_neg_log_joint(data, params, hparams, gmat_in_score_func, estimator_gm
     )
     # Important to compute gradients of acyclicity constraint without logsumexp,
     # since the h(G) function can often be 0.
-    h_grads = torch.stack([h_grad(estimator_gmats[i]) for i in range(_n_mc)])
+    h_grads = torch.stack([h_grad(params["hard_gmats"][i]) for i in range(_n_mc)])
     grad_z_log_prior_acyclic_constr = -hparams["beta"] * torch.mean(
         h_grads,
         dim=0,
@@ -247,7 +235,7 @@ def grad_z_neg_log_joint(data, params, hparams, gmat_in_score_func, estimator_gm
     grad_z_log_likelihood = score_func_estimator_stable(
         params,
         hparams,
-        lambda g: log_joint(data, params | {"hard_gmat": g}, hparams, gmat_in_score_func, estimator_gmat),
+        lambda g: log_joint(data, params | {"hard_gmat": g}, hparams),
         normalized=True,
     )
     result = grad_z_log_prior_z + grad_z_log_likelihood
@@ -259,32 +247,29 @@ def grad_z_neg_log_joint_reparam(data, params, hparams):
     pass
 
 
-def grad_theta_neg_log_joint(data, params, hparams, gmat_in_score_func, estimator_gmat):
+def grad_theta_neg_log_joint(data, params, hparams):
     # _n_mc = hparams["n_score_func_mc_samples"]
     # distr = torch.distributions.Bernoulli(soft_gmat(params["z"], hparams))
     # hard_gmats = distr.sample((_n_mc,))
     # print(f"theta_hard_gmats={torch.mean(hard_gmats, dim=0)}")
-    if estimator_gmat == "hard":
-        estimator_gmats = params["hard_gmats"]
-    else:
-        estimator_gmats = soft_gmat(params["z"], hparams)
-
-    _n_mc = estimator_gmats.shape[0]
+    hard_gmats = params["hard_gmats"]
+    soft_gmat = params["soft_gmat"]
+    _n_mc = hard_gmats.shape[0]
 
     log_fs = torch.tensor(
         [
-            log_joint(data, {**params, "hard_gmat": estimator_gmats[i]}, hparams, gmat_in_score_func, estimator_gmat)
+            log_joint(data, {**params, "hard_gmat": hard_gmats[i]}, hparams)
             for i in range(_n_mc)
         ]
     )
     score_func = lambda g: torch.autograd.grad(
-        log_joint(data, {**params, "hard_gmat": g}, hparams, gmat_in_score_func, estimator_gmat),
+        log_joint(data, {**params, "hard_gmat": g}, hparams),
         params["theta"],
         create_graph=True,
     )[0]
 
     # grad_Theta log p(Theta, D|G) for all Gs
-    scores = torch.clamp(torch.stack([score_func(g) for g in estimator_gmats]), min=1e-32)
+    scores = torch.clamp(torch.stack([score_func(g) for g in hard_gmats]), min=1e-32)
 
     while log_fs.dim() < scores.dim():
         log_fs = log_fs.unsqueeze(-1)
@@ -299,15 +284,6 @@ def grad_theta_neg_log_joint(data, params, hparams, gmat_in_score_func, estimato
 
 
 if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser(description="DIBS experiment settings")
-    parser.add_argument('--grad_z_score_func_gmat', type=str, default='hard', choices=['hard', 'soft'])
-    parser.add_argument('--grad_z_estimator_gmat', type=str, default='hard', choices=['hard', 'soft'])
-    parser.add_argument('--grad_theta_score_func_gmat', type=str, default='hard', choices=['hard', 'soft'])
-    parser.add_argument('--grad_theta_estimator_gmat', type=str, default='hard', choices=['hard', 'soft'])
-    args = parser.parse_args()
-
-
     torch.manual_seed(42)
     # Parameter
     N, d = 100, 3
@@ -355,15 +331,11 @@ if __name__ == "__main__":
             data,
             {**params, "hard_gmats": hard_gmats, "theta": params["theta"].detach()},
             hparams,
-            args.grad_z_score_func_gmat,
-            args.grad_z_estimator_gmat
         )
         grad_theta = grad_theta_neg_log_joint(
             data,
             {**params, "hard_gmats": hard_gmats, "z": params["z"].detach()},
             hparams,
-            args.grad_theta_score_func_gmat,
-            args.grad_theta_estimator_gmat
         )
         grads = {"z": grad_z, "theta": grad_theta}
         for name, param in params.items():
@@ -379,8 +351,8 @@ if __name__ == "__main__":
                 torch.mean(torch.abs(grads["theta"])).float().detach().numpy()
             )
             print(f"{grad_z_norm=}, {grad_theta_norm=}")
-            _params = {**params, "hard_gmat": hard_gmat(params["z"], hparams)}
-            print(f"{log_joint(data, _params, hparams, 'hard', 'hard')=}")
+            _params = {**params, "hard_gmat": hard_gmat(params["z"])}
+            print(f"{log_joint(data, _params, hparams)=}")
             print(f"soft_gmat={soft_gmat(params['z'], hparams)}")
 
     # Plot results
