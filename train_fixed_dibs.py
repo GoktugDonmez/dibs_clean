@@ -184,8 +184,8 @@ def train_dibs(config: Dict[str, Any]) -> Tuple[DiBSFixed, Dict[str, Any]]:
     # Initialize hyperparameters
     sigma_z = 1.0 / np.sqrt(config['latent_dim'])
     hparams = {
-        'alpha': 0.0,  # Will be annealed
-        'beta': 0.0,   # Will be annealed
+        'alpha': 0.2,  # Will be annealed
+        'beta': 1.0,   # Will be annealed
         'alpha_base': config['alpha_base'],
         'beta_base': config['beta_base'],
         'sigma_z': sigma_z,
@@ -228,10 +228,11 @@ def train_dibs(config: Dict[str, Any]) -> Tuple[DiBSFixed, Dict[str, Any]]:
                 
                 # Get current learned graph
                 learned_soft = outputs['soft_adj']
+                print(f"learned_soft:\n{learned_soft}")
                 learned_hard = model.get_hard_adjacency(hparams, threshold=0.5)
                 
                 # Compute metrics
-                metrics = compute_metrics(learned_hard.cpu(), G_true.cpu())
+                #metrics = compute_metrics(learned_hard.cpu(), G_true.cpu())
                 
                 # Acyclicity check
                 acyc_val = acyclic_constr(learned_soft, config['n_nodes']).item()
@@ -240,18 +241,17 @@ def train_dibs(config: Dict[str, Any]) -> Tuple[DiBSFixed, Dict[str, Any]]:
                 log.info(f"Log-joint: {log_joint_val:.2f}")
                 log.info(f"Grad norms - Z: {grad_z_norm:.2e}, Theta: {grad_theta_norm:.2e}")
                 log.info(f"Hyperparams - Alpha: {hparams['alpha']:.3f}, Beta: {hparams['beta']:.3f}")
-                log.info(f"Metrics - SHD: {metrics['shd']:.0f}, F1: {metrics['f1']:.3f}, Precision: {metrics['precision']:.3f}, Recall: {metrics['recall']:.3f}")
+                #log.info(f"Metrics - SHD: {metrics['shd']:.0f}, F1: {metrics['f1']:.3f}, Precision: {metrics['precision']:.3f}, Recall: {metrics['recall']:.3f}")
                 log.info(f"Acyclicity constraint: {acyc_val:.3f}")
                 log.info(f"Edge prob range: [{learned_soft.min().item():.3f}, {learned_soft.max().item():.3f}]")
                 
                 # Store history
                 log_joint_history.append(log_joint_val)
-                shd_history.append(metrics['shd'])
+                #shd_history.append(metrics['shd'])
     
     # Final evaluation
     with torch.no_grad():
-        final_outputs = model(data, hparams)
-        learned_soft_final = final_outputs['soft_adj']
+        learned_soft_final = soft_gmat(model.z, hparams['alpha'])
         learned_hard_final = model.get_hard_adjacency(hparams, threshold=0.5)
         final_metrics = compute_metrics(learned_hard_final.cpu(), G_true.cpu())
         
@@ -334,10 +334,10 @@ def main():
     parser.add_argument('--p_edge', type=float, default=0.4, help='Edge probability for Erdős-Rényi')
     parser.add_argument('--num_samples', type=int, default=200, help='Number of data samples')
     parser.add_argument('--num_iterations', type=int, default=2000, help='Number of training iterations')
-    parser.add_argument('--lr', type=float, default=1e-2, help='Learning rate')
-    parser.add_argument('--alpha_base', type=float, default=10.0, help='Base value for alpha annealing')
-    parser.add_argument('--beta_base', type=float, default=100.0, help='Base value for beta annealing')
-    parser.add_argument('--n_mc_samples', type=int, default=64, help='Number of Monte Carlo samples')
+    parser.add_argument('--lr', type=float, default=5e-3, help='Learning rate')
+    parser.add_argument('--alpha_base', type=float, default=1.0, help='Base value for alpha annealing')
+    parser.add_argument('--beta_base', type=float, default=10.0, help='Base value for beta annealing')
+    parser.add_argument('--n_mc_samples', type=int, default=128, help='Number of Monte Carlo samples')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--save_results', type=str, default=None, help='Path to save results plot')
     
