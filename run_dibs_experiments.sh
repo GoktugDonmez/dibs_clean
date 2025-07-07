@@ -1,10 +1,10 @@
-#!/bin/bash
+#!/bin/bash -l
 #SBATCH --job-name=dibs_experiments
 #SBATCH --time=15:00:00
 #SBATCH --mem=16G
 #SBATCH --array=0-15
-#SBATCH --output=dibs_experiment_%a.out
-#SBATCH --error=dibs_experiment_%a.err
+#SBATCH --output=logs/dibs_%A_%a.out   # %A=job-ID, %a=array-index
+#SBATCH --error=logs/dibs_%A_%a.err
 
 # set the environment
 module load mamba
@@ -32,7 +32,7 @@ grad_theta_estimator_gmat=${grad_theta_estimator_gmats[$gt_e_idx]}
 # source activate your_env
 
 # Run the python script
-python debug/dibs_experiment.py \
+srun python debug/dibs_experiment.py \
     --grad_z_score_func_gmat $grad_z_score_func_gmat \
     --grad_z_estimator_gmat $grad_z_estimator_gmat \
     --grad_theta_score_func_gmat $grad_theta_score_func_gmat \
