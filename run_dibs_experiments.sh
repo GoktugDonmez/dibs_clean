@@ -6,7 +6,12 @@
 #SBATCH --output=dibs_experiment_%a.out
 #SBATCH --error=dibs_experiment_%a.err
 
+# set the environment
+module load mamba
+source activate dibs_env
+
 # Define the combinations of parameters
+
 grad_z_score_func_gmats=("hard" "soft")
 grad_z_estimator_gmats=("hard" "soft")
 grad_theta_score_func_gmats=("hard" "soft")
