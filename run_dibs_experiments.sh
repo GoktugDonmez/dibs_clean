@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=dibs_experiments
 #SBATCH --time=15:00:00
-#SBATCH --mem=16G
+#SBATCH --mem=1G
 #SBATCH --array=0-15
 #SBATCH --output=logs/dibs_%A_%a.out   # %A=job-ID, %a=array-index
 #SBATCH --error=logs/dibs_%A_%a.err
