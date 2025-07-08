@@ -90,14 +90,6 @@ def log_prior_z(z: torch.Tensor) -> torch.Tensor:
     return torch.sum(dist.log_prob(z))
 
 
-def log_prior_z(z: torch.Tensor) -> torch.Tensor:
-    """Computes the regularizer part of the prior on z: log p(z)."""
-    d = z.shape[0]
-    variance = 1.0 / torch.sqrt(torch.tensor(d, dtype=z.dtype, device=z.device))
-    dist = torch.distributions.Normal(0, torch.sqrt(variance))
-    return torch.sum(dist.log_prob(z))
-
-
 def log_prior_z_grad(z: torch.Tensor) -> torch.Tensor:
     """Computes the prior on z: log p(z)."""
     return -(1 / torch.sqrt(torch.tensor(z.shape[0]))) * z
