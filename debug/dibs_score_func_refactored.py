@@ -10,6 +10,9 @@ import torch.nn.functional as F
 # - CHECK REQUIRES GRAD AND DETACH for theta and z, is it right now?
 # - Try different combinations of soft hard gmats, send to triton.
 # - Add reparameterization trick
+#
+# - Lower priority:
+#
 # - Add how to use vmap for parallel computation? learn and implement
 # - Add log joint function and change the logging 
 # - Add mlflow logging
