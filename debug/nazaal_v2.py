@@ -381,8 +381,9 @@ if __name__ == "__main__":
             )
             print(f"{grad_z_norm=}, {grad_theta_norm=}")
             _params = {**params, "hard_gmat": hard_gmat(params["z"])}
-            print(f"{log_joint(data, _params, hparams)=}")
+            print(f"{log_joint_z(data, _params, hparams)=}")
             print(f"soft_gmat={soft_gmat(params['z'], hparams)}")
+            print(f"alpha={hparams['alpha']}, beta={hparams['beta']}")
 
     # Plot results
     learnt_soft_gmat = soft_gmat(params["z"], {"alpha": 1.0})

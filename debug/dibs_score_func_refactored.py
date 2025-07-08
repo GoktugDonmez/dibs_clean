@@ -6,6 +6,15 @@ import torch.nn as nn
 import igraph as ig
 import torch.nn.functional as F
 
+# TODO tomorrow:
+# - CHECK REQUIRES GRAD AND DETACH for theta and z, is it right now?
+# - Try different combinations of soft hard gmats, send to triton.
+# - Add reparameterization trick
+# - Add how to use vmap for parallel computation? learn and implement
+# - Add log joint function and change the logging 
+# - Add mlflow logging
+# - check more in detail the erdos renyi and scale free graphs
+
 # =============================================================================
 # 0. CONFIGURATION
 # =============================================================================
@@ -17,19 +26,19 @@ log = logging.getLogger()
 class Config:
     seed = 42
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    data_source = 'erdos_renyi' # 'erdos_renyi' or  'simple_chain'
-    d_nodes = 4
+    data_source = 'simple_chain' # 'erdos_renyi' or  'simple_chain'
+    d_nodes = 3
     num_samples = 100
     obs_noise_std = 0.1
     chain_length = d_nodes
     p_edge = 0.6
     m_edges = 2
     alpha_base = 0.02
-    beta_base = 1.0
+    beta_base = 1
     theta_prior_sigma = 1.0
     n_mc_samples = 128
     lr = 5e-3
-    num_iterations = 2000
+    num_iterations = 1000
     debug_print_iter = DEBUG_PRINT_ITER
 
 # =============================================================================
@@ -139,6 +148,7 @@ def score_function_estimator(
         
         log_f_samples.append(log_f_val.detach())
         grad_samples.append(grad)
+
 
     grad_samples = torch.stack(grad_samples)
     log_f_samples = torch.stack(log_f_samples)
@@ -323,15 +333,24 @@ class DIBSTrainer:
         return data, G_true, Theta_true
 
     def _update_hparams(self, t: int):
-        progress = t / self.hparams['total_steps']
-        self.hparams['alpha'] = 100 * progress
+        # Version 0 : original linear annealing
+        self.hparams['alpha'] = self.hparams['alpha_base'] * t
+        self.hparams['beta'] = self.hparams['beta_base'] * t
+
         
-        burn_in_fraction = 0.25
-        if progress < burn_in_fraction:
-            self.hparams['beta'] = 0.0
-        else:
-            adjusted_progress = (progress - burn_in_fraction) / (1 - burn_in_fraction)
-            self.hparams['beta'] = 1000 * adjusted_progress
+        # Version 1:  burn in
+        #progress = t / self.hparams['total_steps']
+        #self.hparams['alpha'] = 100 * progress
+        
+        #burn_in_fraction = 0.25
+        #if progress < burn_in_fraction:
+        #    self.hparams['beta'] = 0.0
+        #else:
+        #    adjusted_progress = (progress - burn_in_fraction) / (1 - burn_in_fraction)
+        #    self.hparams['beta'] = 1000 * adjusted_progress
+
+        
+        
         self.hparams['current_t'] = t
 
     def train(self):
