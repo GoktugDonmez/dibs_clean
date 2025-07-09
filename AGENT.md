@@ -1,117 +1,40 @@
-# DiBS: Differentiable Bayesian Structure Learning
+# 1. General Project Goal
 
-This repository implements DiBS (Differentiable Bayesian Structure Learning).
+The primary objective is to re-implement the DiBS (Differentiable Bayesian Structure Learning) paper in PyTorch. This serves two purposes:
+1.  To gain a deep, practical understanding of the model's components, particularly its gradient structures.
+2.  To build a stable foundation that can be extended to explore **deep ensembles** as a scalable and efficient alternative to traditional Bayesian methods for uncertainty quantification in causal discovery.
 
-## Project Structure
+Once a stable DiBS implementation is achieved, the project will focus on deep ensembles completely:
+*   **Nonlinear SCMs:** Extending the model to handle nonlinear causal relationships using neural networks.
+*   **Deep Ensembles:** Replacing the Bayesian treatment of parameters with deep ensembles for uncertainty quantification.
+*   **Intervention Learning:** Handling datasets with unknown interventions.
+*   **Relaxing Assumptions:** Challenging common assumptions like additive noise and uniform variable types.
+*   **Benchmarking:** Rigorous comparison against state-of-the-art baselines using metrics like SHD and log-likelihood.
 
-```
-.
-├── data/
-│   └── graph_data.py          # Data generation utilities
-|──debug/
-      -debug_notebook.ipynb experiments and changes made to the code will be done here
-      -dibs_debug.py same dibs model to be changed and tested for the debugging
-├── models/
-│   ├── __init__.py
-│   ├── dibs.py               # Core DiBS implementation
-│   └── utils.py              # Utility functions
-├── notebooks/
-│   └── dibs_experiment.ipynb # Main experiment notebook (use this)
-├── tests/
-│   └── 
-├── main.py                   # empty
-├── environment.yml           # Conda environment specification
-├── requirements.txt          # Pip requirements
-└── README.md                 # This file
-```
+---
 
-## Setup Instructions
+# 2. Our Collaboration Protocol
 
-### Option 1: Using Conda (Recommended)
+To ensure our collaboration is effective and safe, we will adhere to the following protocol:
 
-1. **Clone the repository**
-   ```bash
-   git clone <repository-url>
-   cd dibs_clean
-   ```
+1.  **My Role is Research Assistant:** I will act as a thinking partner. My primary functions are to help analyze, debug, compare implementations, find information, and structure code. I am not just a code generator.
+2.  **Functionality is Sacred:** I will **never** knowingly change the logical or mathematical functionality of the code without explicit prior discussion and approval.
+3.  **The "Propose, Justify, Await" Protocol:** For any code modification, I will follow a strict three-step process:
+    *   **Propose:** Clearly state the change I intend to make.
+    *   **Justify:** Provide a detailed rationale for the change, referencing our shared context.
+    *   **Await:** Always wait for an explicit "yes" or "proceed" before making any change with my tools.
+4.  **Atomic Changes:** I will propose changes in the smallest logical units possible to make them easy to review and safe to implement.
 
-2. **Create and activate conda environment**
-   ```bash
-   conda env create -f environment.yml
-   conda activate dibs_env
-   ```
+---
+
+# 3. Progress Log
+
+*Reverse-chronological order (newest on top).*
+
+**2025-07-09**
 
 
-
-## Usage
-
-### Running Experiments
-
-1. **Start Jupyter Lab**
-   ```bash
-   jupyter lab
-   ```
-
-2. **Open and run the experiment notebook**
-   - Navigate to `notebooks/dibs_experiment.ipynb`
-   - Follow the cells to run DiBS experiments
-
-### Configuration
-
-The main configuration is handled through the `Config` class in the notebook. Key parameters include:
-
-- `d_nodes`: Number of nodes in the graph
-- `n_samples`: Number of data samples
-- `alpha_val`, `beta_val`: DiBS hyperparameters
-- `lr`: Learning rate
-- `num_iterations`: Training iterations
-
-### MLflow Tracking
-
-Experiments are automatically tracked using MLflow. To view results:
-
-```bash
-mlflow ui
-```
-
-Then navigate to `http://localhost:5000` in your browser.
-
-## Key Components
-
-### Data Generation
-- **Simple Chain**: Creates a simple chain graph structure
-- **Synthetic**: Generates random DAGs with specified parameters
-
-### Models
-- **DiBS Core**: Implementation of the DiBS algorithm
-- **Gradient Computation**: Stable gradient computation with logsumexp problematic
-- **Constraint Handling**: Acyclicity constraints
-
-### Training Loops
-- **Basic Training**: Simple gradient-based optimization
-- **Enhanced Training**: Advanced training with monitoring and MLflow integration
-
-## Testing NOT YET DONE
-
-Run tests using pytest: 
-```bash
-pytest tests/
-```
-
-## Dependencies
-
-Core dependencies:
-- PyTorch: Deep learning framework
-- NumPy: Numerical computing
-- MLflow: Experiment tracking
-- NetworkX: Graph analysis
-- python-igraph: Graph processing
-- Matplotlib: Visualization
-
-## Troubleshooting
-
-### Known Issues
-
-- **LogSumExp Stability**: correct logsumexp is needed for gradient calculations are problematic
-- **Gradient theta and z update**:  both should be updated, the gradients are incorrect, 
-- **Positive log joint**: the log joint gives positive and very big values which it shuldnt have. Should test with a basic model the issues only wit related to likelihood function.
+*   **Decision:** Established a new three-part structure for `AGENT.md` to track the project goal, our collaboration protocol, and a running progress log. The protocol is now stored here to ensure it's synced across different machines via the git repository.
+*   **Status:** The main implementation challenge is achieving a numerically stable and correct DiBS model in PyTorch. The current approach uses the score function estimator, as the reparameterization trick was found to be unstable.
+*   **Key Files:** The most up-to-date code is in `debug/dibs_score_func_refactored.py`.
+*   **Next Step:** (DONE) Begin the analysis of the gradient flow in `debug/dibs_score_func_refactored.py`, focusing on the correct usage of `requires_grad` and `.detach()` to prevent gradient leakage (This is done now, .deteach added in training loop).

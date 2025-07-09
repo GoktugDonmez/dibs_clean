@@ -5,6 +5,7 @@ from typing import Dict, Any, Tuple
 import torch.nn as nn
 import igraph as ig
 import torch.nn.functional as F
+from torch.func import vmap, grad
 
 # TODO tomorrow:
 # - Try different combinations of soft hard gmats, send to triton.
@@ -12,7 +13,6 @@ import torch.nn.functional as F
 #
 # - Lower priority:
 #
-# - Add how to use vmap for parallel computation? learn and implement
 # - Add log joint function and change the logging 
 # - Add mlflow logging
 # - check more in detail the erdos renyi and scale free graphs
@@ -40,7 +40,7 @@ class Config:
     theta_prior_sigma = 1.0
     n_mc_samples = 128
     lr = 5e-3
-    num_iterations = 1000
+    num_iterations = 3000
     debug_print_iter = DEBUG_PRINT_ITER
 
 # =============================================================================
@@ -135,25 +135,19 @@ def score_function_estimator(
     g_samples: torch.Tensor
 ) -> torch.Tensor:
     """
-    A general score function estimator for gradients of an expectation.
+    A general score function estimator for gradients of an expectation, vectorized with vmap.
     Computes ∇ E_{p(G|z)}[f(G, θ)]
     """
-    log_f_samples = []
-    grad_samples = []
+    theta = params_to_grad['theta']
 
-    for g in g_samples:
-        # Clone parameters to compute gradients for this specific sample g
-        theta_for_grad = params_to_grad['theta'].clone().requires_grad_(True) # check here if needed to clone?
-        
-        log_f_val = log_prob_fn(g, theta_for_grad)
-        grad, = torch.autograd.grad(log_f_val, theta_for_grad)
-        
-        log_f_samples.append(log_f_val.detach())
-        grad_samples.append(grad)
+    # grad(log_prob_fn, argnums=1) creates a function that computes gradient w.r.t. theta.
+    # We vmap this function over g_samples to get per-sample gradients.
+    grad_fn = grad(log_prob_fn, argnums=1)
+    grad_samples = vmap(grad_fn, in_dims=(0, None))(g_samples, theta)
 
+    # We vmap again to get the log probability values for each sample, detaching theta.
+    log_f_samples = vmap(log_prob_fn, in_dims=(0, None))(g_samples, theta.detach())
 
-    grad_samples = torch.stack(grad_samples)
-    log_f_samples = torch.stack(log_f_samples)
     return _calculate_weighted_score(grad_samples, log_f_samples)
 
 # =============================================================================
@@ -165,7 +159,7 @@ def compute_z_gradient(
     data: Dict[str, Any],
     hparams: Dict[str, Any]
 ) -> torch.Tensor:
-    """Computes ∇_z log p(D, θ, z)."""
+    """Computes ∇_z log p(D, θ, z) using vmap for vectorization."""
     z, theta = params['z'], params['theta']
     g_samples = hparams['g_samples']
 
@@ -173,18 +167,25 @@ def compute_z_gradient(
     grad_z_prior = log_prior_z_grad(z)
 
     # 2. Gradient of the likelihood term: ∇_z E_{p(G|z)}[p(D,θ|G)]
+    
+    # Define a function to compute log p(G|z) for grad
+    log_prob_g_given_z = lambda g, z_param: torch.distributions.Bernoulli(get_soft_gmat(z_param, hparams)).log_prob(g).sum()
+    
+    # Create a function that computes the gradient of log p(G|z) w.r.t. z
+    score_fn_z = grad(log_prob_g_given_z, argnums=1)
+    
+    # Vectorize the score function over g_samples
+    scores = vmap(score_fn_z, in_dims=(0, None))(g_samples, z)
+
+    # Define and vectorize the log-joint function f(G) = log p(D,θ|G)
     log_joint_fn = lambda g: log_likelihood_given_g_and_theta(data, g, theta, hparams) + log_prior_theta(g, theta, hparams)
+    log_f_values = vmap(log_joint_fn)(g_samples)
     
-    score_fn = lambda g: torch.autograd.grad(
-        torch.distributions.Bernoulli(get_soft_gmat(z, hparams)).log_prob(g).sum(),
-        z, create_graph=True)[0]
-    
-    scores = torch.stack([score_fn(g) for g in g_samples])
-    log_f_values = torch.stack([log_joint_fn(g) for g in g_samples])
     grad_lik = _calculate_weighted_score(scores, log_f_values)
 
     # 3. Gradient of the acyclicity constraint: ∇_z E_{p(G|z)}[h(G)]
-    h_values = torch.stack([acyclic_constr(g) for g in g_samples])
+    h_values = vmap(acyclic_constr)(g_samples)
+    # The multiplication and mean are already vectorized.
     grad_acyc = torch.mean(h_values.view(-1, 1, 1, 1) * scores, dim=0)
 
     total_grad = grad_z_prior + grad_lik - hparams['beta'] * grad_acyc
@@ -391,14 +392,17 @@ class DIBSTrainer:
             g_hard = (g_soft > 0.5).float()
             shd = torch.sum(torch.abs(g_hard.cpu() - self.G_true.cpu()))
             
-            # --- Log Joint Calculation ---
+            # --- Log Joint Calculation (Vectorized) ---
             theta = self.params['theta']
             z = self.params['z']
             g_samples = self.hparams['g_samples']
 
-            log_lik_samples = torch.stack([log_likelihood_given_g_and_theta(self.data, g, theta, self.hparams) for g in g_samples])
-            log_theta_prior_samples = torch.stack([log_prior_theta(g, theta, self.hparams) for g in g_samples])
-            acyclicity_samples = torch.stack([acyclic_constr(g) for g in g_samples])
+            log_lik_fn = lambda g: log_likelihood_given_g_and_theta(self.data, g, theta, self.hparams)
+            log_theta_prior_fn = lambda g: log_prior_theta(g, theta, self.hparams)
+
+            log_lik_samples = vmap(log_lik_fn)(g_samples)
+            log_theta_prior_samples = vmap(log_theta_prior_fn)(g_samples)
+            acyclicity_samples = vmap(acyclic_constr)(g_samples)
 
             exp_log_lik = torch.mean(log_lik_samples)
             exp_log_theta_prior = torch.mean(log_theta_prior_samples)
@@ -437,7 +441,7 @@ class DIBSTrainer:
             log.info(f"\nStructural Hamming Distance: {shd}")
 
 def main():
-    log.info("--- Running ORIGINAL version ---")
+    log.info("--- Running VECTORIZED version ---")
     cfg = Config()
     trainer = DIBSTrainer(cfg)
     trainer.train()
