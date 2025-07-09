@@ -142,6 +142,8 @@ Thumbs.db
 *.temp
 tmp/
 temp/
+temp_original_code/
+temp_nazaal/
 
 # Configuration files with secrets
 config/secrets.yaml

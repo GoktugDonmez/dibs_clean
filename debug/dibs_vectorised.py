@@ -42,6 +42,10 @@ class Config:
     lr = 5e-3
     num_iterations = 3000
     debug_print_iter = DEBUG_PRINT_ITER
+    
+    # Reparameterization trick
+    #use_reparam_trick = True
+    #tau = 1.0 # Temperature for Gumbel-Sigmoid
 
 # =============================================================================
 # 1. CORE COMPONENTS
@@ -70,6 +74,17 @@ def get_soft_gmat(z: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
     d = z.shape[0]
     diag_mask = 1.0 - torch.eye(d, device=z.device, dtype=z.dtype)
     return soft_probs * diag_mask
+
+def get_gumbel_soft_gmat(z: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
+
+    scores = get_graph_scores(z, hparams)
+    u = torch.rand_like(scores)
+    L = torch.log(u) - torch.log1p(-u)
+    logits = (scores + L) / hparams["tau"] #tau =1
+    g_soft = torch.sigmoid(logits)
+    d = g_soft.size(-1)
+    mask = 1.0 - torch.eye(d, device=z.device, dtype=z.dtype)
+    return g_soft * mask
 
 # =============================================================================
 # 2. LOG-PROBABILITY FUNCTIONS
