@@ -32,7 +32,9 @@ To ensure our collaboration is effective and safe, we will adhere to the followi
 *Reverse-chronological order (newest on top).*
 
 **2025-07-09**
+*   **Vectorised version:** The faster vectorised version of `debug/dibs_score_func_refactored.py` is implemented in `debug/dibs_vectorised`.py 
 
+*   **Issues learning:** The model still does not learn correctly. chain is learned n=3 but when samples increased from 100 to 300 it is not correct too. sometimes it gets closely with n=4 n=5. 
 
 *   **Decision:** Established a new three-part structure for `AGENT.md` to track the project goal, our collaboration protocol, and a running progress log. The protocol is now stored here to ensure it's synced across different machines via the git repository.
 *   **Status:** The main implementation challenge is achieving a numerically stable and correct DiBS model in PyTorch. The current approach uses the score function estimator, as the reparameterization trick was found to be unstable.
