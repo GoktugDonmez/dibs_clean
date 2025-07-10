@@ -32,6 +32,7 @@ To ensure our collaboration is effective and safe, we will adhere to the followi
 *Reverse-chronological order (newest on top).*
 
 **2025-07-10**
+*   **Experimentation Setup:** Created a `gemini/` directory to store agent-generated scripts. To investigate why model performance degrades with increased sample size, the main script `debug/dibs_vectorised.py` was parameterized to accept command-line arguments. A new script, `gemini/run_sample_size_sweep.sh`, was created to automate running 10 experiments with `num_samples` ranging from 100 to 1000. 
 *   **MLflow Integration:** Integrated MLflow into `debug/dibs_vectorised.py` to track experiment parameters, metrics (SHD, objective), and artifacts. The soft graph probabilities are now saved as `.npy` artifacts at each logging step to avoid performance degradation.
 *   **Execution Protocol:** Established that scripts must be run using `conda run -n dibs_env python <script_name>` to ensure the correct non-interactive execution within the specified Conda environment.
 
