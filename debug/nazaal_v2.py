@@ -47,7 +47,7 @@ def grad_z_log_joint_gumbel(data, params, hparams):
     # grad_z_g = torch.autograd.grad(soft_gmat, params["z"])
 
     grad_z_log_joint = torch.autograd.grad(
-        log_joint(data, {**params, "soft_gmat": soft_gmat}, hparams), params["z"]
+        log_joint_z(data, {**params, "soft_gmat": soft_gmat}, hparams), params["z"]
     )
     return grad_z_log_joint
 
@@ -55,7 +55,8 @@ def grad_z_log_joint_gumbel(data, params, hparams):
 def hard_gmat(z):
     d = z.shape[0]
     cycle_mask = 1.0 - torch.eye(d)
-    inner_product_scores = torch.einsum("ik, jk -> ij", z[:, :, 0], z[:, :, 1])
+    u, v = z[:, :, 0], z[:, :, 1]
+    inner_product_scores = (u @ v.T)
     return cycle_mask * (inner_product_scores > 0.0)
 
 
@@ -63,7 +64,8 @@ def soft_gmat(z, hparams):
     # Deterministic transform of the latent variable z to a soft adjacency matrix
     d = z.shape[0]
     cycle_mask = 1.0 - torch.eye(d)
-    inner_product_scores = torch.einsum("ik, jk -> ij", z[:, :, 0], z[:, :, 1])
+    u, v = z[:, :, 0], z[:, :, 1]
+    inner_product_scores = (u @ v.T)
     soft_gmat_unmasked = torch.sigmoid(hparams["alpha"] * inner_product_scores)
     return cycle_mask * soft_gmat_unmasked
 
@@ -106,6 +108,28 @@ def stable_mean(fxs):
     avg_ngve = stable_mean_psve_only(f_xs_ngve, n_ngve)
 
     return (n_psve / fxs.size) * avg_psve - (n_ngve / fxs.size) * avg_ngve
+
+def _calculate_weighted_score(grad_samples: torch.Tensor, log_density_samples: torch.Tensor) -> torch.Tensor:
+    """
+    Numerically stable computation of an expectation of gradients weighted by normalized probabilities.
+    Computes: E_{p(x)}[grad(x)] = sum(p_i * grad_i) / sum(p_i)
+    """
+    eps = 1e-30
+
+    while log_density_samples.dim() < grad_samples.dim():
+        log_density_samples = log_density_samples.unsqueeze(-1)
+
+    log_den = torch.logsumexp(log_density_samples, dim=0) - torch.log(torch.tensor(len(log_density_samples), dtype=log_density_samples.dtype, device=log_density_samples.device))
+
+    pos_grads = torch.where(grad_samples >= 0, grad_samples, 0.)
+    neg_grads = torch.where(grad_samples < 0, -grad_samples, 0.)
+
+    log_num_pos = torch.logsumexp(log_density_samples + torch.log(pos_grads + eps), dim=0) - torch.log(torch.tensor(len(log_density_samples), dtype=log_density_samples.dtype, device=log_density_samples.device))
+    log_num_neg = torch.logsumexp(log_density_samples + torch.log(neg_grads + eps), dim=0) - torch.log(torch.tensor(len(log_density_samples), dtype=log_density_samples.dtype, device=log_density_samples.device))
+    
+    return torch.exp(log_num_pos - log_den) - torch.exp(log_num_neg - log_den)
+
+
 
 
 def log_joint_z(data, params, hparams):
@@ -220,20 +244,22 @@ def score_func_estimator_stable(params, hparams, log_f, normalized=True):
     # grad_Z log p(G|Z) for all Gs
     scores = torch.stack([score_func(g) for g in hard_gmats])
 
-    while log_fs.dim() < scores.dim():
-        log_fs = log_fs.unsqueeze(-1)
+    #while log_fs.dim() < scores.dim():
+    #    log_fs = log_fs.unsqueeze(-1)
 
-    log_numerator = torch.logsumexp(
-        log_fs + torch.log(torch.abs(scores)) * torch.sign(scores),
-        dim=0,
-    )
+    #log_numerator = torch.logsumexp(
+    #    log_fs + torch.log(torch.abs(scores)) * torch.sign(scores),
+    #    dim=0,
+    #)
 
-    if normalized:
-        # If the score function estimator has a denominator
-        log_denominator = torch.logsumexp(log_fs, dim=0)
-        result = torch.exp(log_numerator - log_denominator)
-    else:
-        result = torch.exp(log_numerator - torch.log(torch.tensor(_n_mc)))
+    #if normalized:
+    #    # If the score function estimator has a denominator
+    #    log_denominator = torch.logsumexp(log_fs, dim=0)
+    #    result = torch.exp(log_numerator - log_denominator)
+    #else:
+    #    result = torch.exp(log_numerator - torch.log(torch.tensor(_n_mc)))
+    result = _calculate_weighted_score(scores, log_fs)
+
 
     return result
 
@@ -300,16 +326,19 @@ def grad_theta_neg_log_joint(data, params, hparams):
     # grad_Theta log p(Theta, D|G) for all Gs
     scores = torch.clamp(torch.stack([score_func(g) for g in hard_gmats]), min=1e-32)
 
-    while log_fs.dim() < scores.dim():
-        log_fs = log_fs.unsqueeze(-1)
-
-    log_numerator = torch.logsumexp(
-        log_fs + torch.log(torch.abs(scores)) * torch.sign(scores),
-        dim=0,
-    )
-    log_denominator = torch.logsumexp(log_fs, dim=0)
-    result = torch.exp(log_numerator - log_denominator)
+    result = _calculate_weighted_score(scores, log_fs)
     return -result
+
+    #while log_fs.dim() < scores.dim():
+    #    log_fs = log_fs.unsqueeze(-1)
+    #
+    #log_numerator = torch.logsumexp(
+    #    log_fs + torch.log(torch.abs(scores)) * torch.sign(scores),
+    #    dim=0,
+    #)
+    #log_denominator = torch.logsumexp(log_fs, dim=0)
+    #result = torch.exp(log_numerator - log_denominator)
+    #return -result
 
 
 if __name__ == "__main__":

@@ -36,8 +36,8 @@ class Config:
     chain_length = d_nodes
     p_edge = 0.6
     m_edges = 2
-    alpha_base = 0.02
-    beta_base = 1
+    alpha_base = 0.01
+    beta_base = 0.1
     theta_prior_sigma = 1.0
     n_mc_samples = 128
     lr = 5e-3
@@ -125,7 +125,7 @@ def log_prior_z_grad(z: torch.Tensor) -> torch.Tensor:
 # 3. GRADIENT ESTIMATION
 # =============================================================================
 
-def _calculate_weighted_score(grad_samples: torch.Tensor, log_density_samples: torch.Tensor) -> torch.Tensor:
+def _calculate_weighted_score_old(grad_samples: torch.Tensor, log_density_samples: torch.Tensor) -> torch.Tensor:
     """
     Numerically stable computation of an expectation of gradients weighted by normalized probabilities.
     Computes: E_{p(x)}[grad(x)] = sum(p_i * grad_i) / sum(p_i)
@@ -142,8 +142,75 @@ def _calculate_weighted_score(grad_samples: torch.Tensor, log_density_samples: t
 
     log_num_pos = torch.logsumexp(log_density_samples + torch.log(pos_grads + eps), dim=0) - torch.log(torch.tensor(len(log_density_samples), dtype=log_density_samples.dtype, device=log_density_samples.device))
     log_num_neg = torch.logsumexp(log_density_samples + torch.log(neg_grads + eps), dim=0) - torch.log(torch.tensor(len(log_density_samples), dtype=log_density_samples.dtype, device=log_density_samples.device))
-    
+
     return torch.exp(log_num_pos - log_den) - torch.exp(log_num_neg - log_den)
+
+def _calculate_weighted_score(grad_samples: torch.Tensor, log_density_samples: torch.Tensor) -> torch.Tensor:
+    """
+    Numerically stable computation that preserves multi-dimensional gradient structure
+    while using the positive/negative separation approach.
+    """
+    eps = 1e-30
+
+    # Broadcast log_density_samples to match grad_samples dimensions
+    while log_density_samples.dim() < grad_samples.dim():
+        log_density_samples = log_density_samples.unsqueeze(-1)
+
+    # Get the sample count (first dimension)
+    n_samples = grad_samples.shape[0]
+    
+    # Calculate common denominator (only over sample dimension)
+    log_denominator = torch.logsumexp(log_density_samples, dim=0) - torch.log(torch.tensor(n_samples, dtype=grad_samples.dtype, device=grad_samples.device))
+
+    # Use torch.where to separate positive and negative gradients (preserves structure)
+    pos_grads = torch.where(grad_samples >= 0, grad_samples, 0.)
+    neg_grads = torch.where(grad_samples < 0, -grad_samples, 0.)  # Take absolute value
+    
+    # Count positive and negative elements per matrix position
+    pos_mask = (grad_samples >= 0).float()
+    neg_mask = (grad_samples < 0).float()
+    
+    pos_count = pos_mask.sum(dim=0)  # Count per matrix position
+    neg_count = neg_mask.sum(dim=0)  # Count per matrix position
+    total_count = torch.tensor(n_samples, dtype=grad_samples.dtype, device=grad_samples.device)
+    
+    # Calculate positive contribution using LSE
+    pos_log_terms = torch.where(
+        grad_samples >= 0,
+        log_density_samples + torch.log(pos_grads + eps),
+        torch.tensor(-float('inf'), device=grad_samples.device)
+    )
+    # Only compute LSE where we have positive elements
+    log_numerator_pos = torch.where(
+        pos_count > 0,
+        torch.logsumexp(pos_log_terms, dim=0) - torch.log(pos_count),
+        torch.tensor(-float('inf'), device=grad_samples.device)
+    )
+    expected_pos = torch.where(
+        pos_count > 0,
+        (pos_count / total_count) * torch.exp(log_numerator_pos - log_denominator),
+        torch.tensor(0.0, device=grad_samples.device)
+    )
+    
+    # Calculate negative contribution using LSE
+    neg_log_terms = torch.where(
+        grad_samples < 0,
+        log_density_samples + torch.log(neg_grads + eps),
+        torch.tensor(-float('inf'), device=grad_samples.device)
+    )
+    # Only compute LSE where we have negative elements
+    log_numerator_neg = torch.where(
+        neg_count > 0,
+        torch.logsumexp(neg_log_terms, dim=0) - torch.log(neg_count),
+        torch.tensor(-float('inf'), device=grad_samples.device)
+    )
+    expected_neg = torch.where(
+        neg_count > 0,
+        (neg_count / total_count) * torch.exp(log_numerator_neg - log_denominator),
+        torch.tensor(0.0, device=grad_samples.device)
+    )
+    
+    return expected_pos - expected_neg
 
 def score_function_estimator(
     params_to_grad: Dict[str, nn.Parameter],
