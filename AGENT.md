@@ -31,6 +31,10 @@ To ensure our collaboration is effective and safe, we will adhere to the followi
 
 *Reverse-chronological order (newest on top).*
 
+**2025-07-10**
+*   **MLflow Integration:** Integrated MLflow into `debug/dibs_vectorised.py` to track experiment parameters, metrics (SHD, objective), and artifacts. The soft graph probabilities are now saved as `.npy` artifacts at each logging step to avoid performance degradation.
+*   **Execution Protocol:** Established that scripts must be run using `conda run -n dibs_env python <script_name>` to ensure the correct non-interactive execution within the specified Conda environment.
+
 **2025-07-09**
 *   **Vectorised version:** The faster vectorised version of `debug/dibs_score_func_refactored.py` is implemented in `debug/dibs_vectorised`.py 
 
