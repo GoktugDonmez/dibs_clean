@@ -106,15 +106,27 @@ def _calculate_weighted_score_new(grad_samples: torch.Tensor, log_density_sample
     print(f"expected_neg: {expected_neg}")
     return expected_pos - expected_neg
 
+def soft_max_check(grad_samples: torch.Tensor, log_density_samples: torch.Tensor) -> torch.Tensor:
+
+    weights = torch.softmax(log_density_samples, dim=0) 
+    print(f"weights: {weights}")
+
+    weighted_grads = weights * grad_samples
+    print(f"weighted_grads: {weighted_grads}")
+    print(f"sum of weighted_grads: {torch.sum(weighted_grads)}")
+    return torch.sum(weighted_grads)
+
 
 grads = torch.tensor([1.0, -2.0, 3.0, -4.0, 5.0], dtype=torch.float32)
 log_density_samples = torch.tensor([1.0, 2.0, -3.0, 4.0, 5.0], dtype=torch.float32)
 print(f"grads: {grads}")
 print(f"log_density_samples: {log_density_samples}")
 
-
+res_soft_max = soft_max_check(grads, log_density_samples)
 res_old = _calculate_weighted_score_old(grads, log_density_samples)
 res_new = _calculate_weighted_score_new(grads, log_density_samples)
+
+print(f"res_soft_max: {res_soft_max}")
 print(f"res_old: {res_old}")
 print(f"res_new: {res_new}")
 
