@@ -6,6 +6,7 @@ import torch.nn as nn
 import igraph as ig
 import torch.nn.functional as F
 from torch.func import vmap, grad
+import mlflow
 
 # TODO tomorrow:
 # - Try different combinations of soft hard gmats, send to triton.
@@ -373,12 +374,17 @@ class DIBSTrainer:
 
     def train(self):
         log.info("Starting training...")
-        for t in range(1, self.cfg.num_iterations + 1):
-            self._train_step(t)
-            if t % self.cfg.debug_print_iter == 0 or t == self.cfg.num_iterations:
-                self.log_progress(t)
-        log.info("Training finished.")
-        self.evaluate()
+        with mlflow.start_run():
+            # Log parameters from the Config object
+            config_dict = {key: getattr(self.cfg, key) for key in dir(self.cfg) if not key.startswith('__') and not callable(getattr(self.cfg, key))}
+            mlflow.log_params(config_dict)
+
+            for t in range(1, self.cfg.num_iterations + 1):
+                self._train_step(t)
+                if t % self.cfg.debug_print_iter == 0 or t == self.cfg.num_iterations:
+                    self.log_progress(t)
+            log.info("Training finished.")
+            self.evaluate()
 
     def _train_step(self, t: int):
         self.optimizer.zero_grad()
@@ -430,6 +436,28 @@ class DIBSTrainer:
             exp_f_g = torch.mean(f_g_samples)
             total_objective = exp_f_g + log_z_prior_reg + log_z_prior_acyc
 
+            # MLflow logging
+            metrics_to_log = {
+                "shd": shd.item(),
+                "total_objective": total_objective.item(),
+                "exp_log_lik": exp_log_lik.item(),
+                "exp_log_theta_prior": exp_log_theta_prior.item(),
+                "log_z_prior_reg": log_z_prior_reg.item(),
+                "log_z_prior_acyc": log_z_prior_acyc.item(),
+                "exp_acyclicity": exp_acyclicity.item(),
+                "alpha": self.hparams['alpha'],
+                "beta": self.hparams['beta']
+            }
+            mlflow.log_metrics(metrics_to_log, step=t)
+
+            # Log g_soft as an artifact
+            import tempfile
+            import os
+            with tempfile.TemporaryDirectory() as tmpdir:
+                g_soft_path = os.path.join(tmpdir, f"g_soft_iter_{t}.npy")
+                np.save(g_soft_path, g_soft.cpu().numpy())
+                mlflow.log_artifact(g_soft_path, artifact_path="g_soft_history")
+
             log.info(f"--- Iter {t}/{self.cfg.num_iterations} ---")
             log.info(f"Annealed: alpha={self.hparams['alpha']:.3f}, beta={self.hparams['beta']:.3f}")
             log.info(f"SHD: {shd.item():.1f}")
@@ -454,9 +482,28 @@ class DIBSTrainer:
             
             shd = torch.abs(self.G_true - learned_hard_graph).sum().item()
             log.info(f"\nStructural Hamming Distance: {shd}")
+            mlflow.log_metric("final_shd", shd)
+
+            # Log artifacts
+            import tempfile
+            import os
+            with tempfile.TemporaryDirectory() as tmpdir:
+                g_true_path = os.path.join(tmpdir, "g_true.txt")
+                theta_true_path = os.path.join(tmpdir, "theta_true.txt")
+                learned_g_path = os.path.join(tmpdir, "learned_g.txt")
+                learned_theta_path = os.path.join(tmpdir, "learned_theta.txt")
+                
+                np.savetxt(g_true_path, self.G_true.cpu().numpy(), fmt='%.2f')
+                np.savetxt(theta_true_path, self.Theta_true.cpu().numpy(), fmt='%.2f')
+                np.savetxt(learned_g_path, learned_hard_graph.cpu().numpy(), fmt='%.2f')
+                np.savetxt(learned_theta_path, self.params['theta'].cpu().numpy(), fmt='%.2f')
+                
+                mlflow.log_artifacts(tmpdir, artifact_path="final_matrices")
+
 
 def main():
     log.info("--- Running VECTORIZED version ---")
+    mlflow.set_experiment("DiBS Vectorised Experiments")
     cfg = Config()
     trainer = DIBSTrainer(cfg)
     trainer.train()
