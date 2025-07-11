@@ -43,6 +43,7 @@ class Config:
     lr = 5e-3
     num_iterations = 3000
     debug_print_iter = DEBUG_PRINT_ITER
+    tau = 1.0  # Gumbel temperature
     
     # Reparameterization trick
     #use_reparam_trick = True
@@ -76,12 +77,10 @@ def get_soft_gmat(z: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
     diag_mask = 1.0 - torch.eye(d, device=z.device, dtype=z.dtype)
     return soft_probs * diag_mask
 
-def get_gumbel_soft_gmat(z: torch.Tensor, hparams: Dict[str, Any]) -> torch.Tensor:
+def get_gumbel_soft_gmat(z: torch.Tensor, hparams: Dict[str, Any], noise: torch.Tensor) -> torch.Tensor:
 
     scores = get_graph_scores(z, hparams)
-    u = torch.rand_like(scores)
-    L = torch.log(u) - torch.log1p(-u)
-    logits = (scores + L) / hparams["tau"] #tau =1
+    logits = (scores + noise) / hparams["tau"]
     g_soft = torch.sigmoid(logits)
     d = g_soft.size(-1)
     mask = 1.0 - torch.eye(d, device=z.device, dtype=z.dtype)
@@ -124,6 +123,11 @@ def log_prior_z_grad(z: torch.Tensor) -> torch.Tensor:
 # =============================================================================
 # 3. GRADIENT ESTIMATION
 # =============================================================================
+def _calculate_weighted_score(grad_samples: torch.Tensor, log_density_samples: torch.Tensor) -> torch.Tensor:
+    # wrapped in a function to allow for easy switching between old and new versions
+    #res = _calculate_weighted_score_old(grad_samples, log_density_samples)
+    res = _calculate_weighted_score_new(grad_samples, log_density_samples)
+    return res
 
 def _calculate_weighted_score_old(grad_samples: torch.Tensor, log_density_samples: torch.Tensor) -> torch.Tensor:
     """
@@ -145,7 +149,7 @@ def _calculate_weighted_score_old(grad_samples: torch.Tensor, log_density_sample
 
     return torch.exp(log_num_pos - log_den) - torch.exp(log_num_neg - log_den)
 
-def _calculate_weighted_score(grad_samples: torch.Tensor, log_density_samples: torch.Tensor) -> torch.Tensor:
+def _calculate_weighted_score_new(grad_samples: torch.Tensor, log_density_samples: torch.Tensor) -> torch.Tensor:
     """
     Numerically stable computation that preserves multi-dimensional gradient structure
     while using the positive/negative separation approach.
@@ -237,6 +241,7 @@ def score_function_estimator(
 # 4. MAIN GRADIENT COMPUTATION
 # =============================================================================
 
+
 def compute_z_gradient(
     params: Dict[str, nn.Parameter],
     data: Dict[str, Any],
@@ -252,8 +257,14 @@ def compute_z_gradient(
     # 2. Gradient of the likelihood term: ∇_z E_{p(G|z)}[p(D,θ|G)]
     
     # Define a function to compute log p(G|z) for grad
-    log_prob_g_given_z = lambda g, z_param: torch.distributions.Bernoulli(get_soft_gmat(z_param, hparams)).log_prob(g).sum()
-    
+    #log_prob_g_given_z = lambda g, z_param: torch.distributions.Bernoulli(get_soft_gmat(z_param, hparams)).log_prob(g).sum()
+    def log_prob_g_given_z(g, z_param):
+        probs = get_soft_gmat(z_param, hparams)
+        # Manual log_prob computation that's vmap-friendly
+        log_prob = g * torch.log(probs + 1e-8) + (1 - g) * torch.log(1 - probs + 1e-8)
+        return log_prob.sum()
+
+
     # Create a function that computes the gradient of log p(G|z) w.r.t. z
     score_fn_z = grad(log_prob_g_given_z, argnums=1)
     

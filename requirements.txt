@@ -1,6 +1,8 @@
 # Core dependencies
-torch>=1.9.0
-numpy>=1.21.0
+torch>=2.1.0,<2.2.0
+torchvision>=0.16.0,<0.17.0
+torchaudio>=2.1.0,<2.2.0
+numpy>=1.21.0,<1.25.0
 scipy>=1.7.0
 matplotlib>=3.5.0
 networkx>=2.6.0

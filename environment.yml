@@ -6,13 +6,13 @@ channels:
   - defaults
 dependencies:
   - python=3.9
-  - pytorch=2.7
-  - torchvision
-  - torchaudio
-  - cpuonly # or cudatoolkit=11.6 for GPU
+  - pytorch=2.1.0
+  - torchvision=0.16.0
+  - torchaudio=2.1.0
+  - cpuonly # or cudatoolkit=11.8 for GPU
   - jupyterlab
   - mlflow
-  - numpy
+  - numpy=1.24.*
   - igraph
   - pandas
   - scikit-learn
